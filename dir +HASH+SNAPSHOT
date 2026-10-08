@@ -1,0 +1,117 @@
+snap_hash=$(rust_call hash "$snap_dir" 2>/dev/null || echo "")
+    if [ -n "$snap_hash" ]; then
+        echo "$snap_hash" > "$snap_dir/snapshot.hash"
+        ok "Hash snapshot : ${snap_hash:0:16}..."
+    fi
+
+    # Taille totale
+    local size
+    size=$(du -sh "$snap_dir" 2>/dev/null | cut -f1)
+    ok "Taille snapshot : $size"
+
+    info "Chemin : $snap_dir"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2. LIST — Lister les snapshots
+# ═══════════════════════════════════════════════════════════════════════════════
+layer_list() {
+    local name="${1:-}"
+
+    sect "Snapshots"
+
+    if [ -n "$name" ]; then
+        local box_snap="$NX_SNAPSHOTS/$name"
+        if [ ! -d "$box_snap" ] || [ -z "$(ls -A "$box_snap" 2>/dev/null)" ]; then
+            info "Aucun snapshot pour $name"
+            return 0
+        fi
+        printf "  %-24s %-20s %-12s %s\n" "TAG" "DATE" "TAILLE" "MESSAGE"
+        printf "  %-24s %-20s %-12s %s\n" "───" "────" "──────" "───────"
+        for snap in "$box_snap"/*; do
+            [ -d "$snap" ] || continue
+            local t
+            t=$(basename "$snap")
+            local date
+            date=$(grep '"created"' "$snap/meta.json" 2>/dev/null | sed 's/.*"created": *"//;s/".*//' | head -c 19)
+            local size
+            size=$(du -sh "$snap" 2>/dev/null | cut -f1)
+            local msg
+            msg=$(grep '"message"' "$snap/meta.json" 2>/dev/null | sed 's/.*"message": *"//;s/".*//' | head -c 40)
+            printf "  %-24s %-20s %-12s %s\n" "$t" "$date" "$size" "$msg"
+        done
+    else
+        if [ -z "$(ls -A "$NX_SNAPSHOTS" 2>/dev/null)" ]; then
+            info "Aucun snapshot"
+            return 0
+        fi
+        printf "  %-16s %-24s %-20s %s\n" "BOX" "TAG" "DATE" "TAILLE"
+        printf "  %-16s %-24s %-20s %s\n" "───" "───" "────" "──────"
+        for box_snap in "$NX_SNAPSHOTS"/*; do
+            [ -d "$box_snap" ] || continue
+            local box_name
+            box_name=$(basename "$box_snap")
+            for snap in "$box_snap"/*; do
+                [ -d "$snap" ] || continue
+                local t
+                t=$(basename "$snap")
+                local date
+                date=$(grep '"created"' "$snap/meta.json" 2>/dev/null | sed 's/.*"created": *"//;s/".*//' | head -c 19)
+                local size
+                size=$(du -sh "$snap" 2>/dev/null | cut -f1)
+                printf "  %-16s %-24s %-20s %s\n" "$box_name" "$t" "$date" "$size"
+            done
+        done
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3. ROLLBACK — Restaurer un snapshot
+# ═══════════════════════════════════════════════════════════════════════════════
+layer_rollback() {
+    local name="${1:-}"
+    local tag="${2:-}"
+
+    if [ -z "$name" ] || [ -z "$tag" ]; then
+        err "Usage : nexusbox layer rollback <box> <tag>"
+        return 1
+    fi
+
+    local box="$NX_BOXES/$name"
+    local snap="$NX_SNAPSHOTS/$name/$tag"
+
+    if [ ! -d "$box" ]; then
+        err "Box introuvable : $name"
+        return 1
+    fi
+    if [ ! -d "$snap" ]; then
+        err "Snapshot introuvable : $tag"
+        return 1
+    fi
+
+    sect "Rollback : $name → $tag"
+
+    # Arrêt box
+    local status
+    status=$(cat "$box/state/status" 2>/dev/null || echo "stopped")
+    if [ "$status" = "running" ]; then
+        warn "Arrêt de la box"
+        bash "$HOME/Documents/nexus_blanche_net/nexusbox.sh" stop "$name" 2>/dev/null
+    fi
+
+    # Snapshot de sécurité avant rollback
+    sub "Snapshot de sécurité (avant rollback)"
+    local pre_tag="pre-rollback-$(date +%Y%m%d-%H%M%S)"
+    layer_snapshot "$name" "$pre_tag" "Safety before rollback" 2>/dev/null
+    ok "Snapshot de secours : $pre_tag"
+
+    # Restauration de l'upper
+    sub "Restauration"
+    if [ -d "$snap/upper" ]; then
+        rm -rf "$box/upper"
+        mkdir -p "$box/upper"
+        cp -a "$snap/upper/." "$box/upper/" 2>/dev/null
+        ok "Upper restauré"
+    else
+        info "Pas d'upper dans ce snapshot — état initial"
+        rm -rf "$box/upper"
