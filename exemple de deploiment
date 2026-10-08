@@ -47,8 +47,17 @@ Arrête-la :
 ```
 
 ---
+pour la compilation utilisation voici la commande 1.creer le projet rust  cd ~/Documents/nexus_blanche_net
+cargo new --bin nexusbox-hash
+cd nexusbox-hash
+
+
+
+
 
 Ce que NexusBox fait différemment de Docker
+
+
 
 Docker NexusBox
 Daemon en arrière-plan (dockerd) Aucun daemon
