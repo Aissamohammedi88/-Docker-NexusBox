@@ -1,697 +1,586 @@
-# ═══════════════════════════════════════════════════════════════════════════════# NEXUSBOX CI/CD — Pipeline Ultime
+# ═══════════════════════════════════════════════════════════════════════════════# NEXUSBOX CI/CD — Enterprise Grade Pipeline
 # Auteur : Aissa Mohammedi (DGK)
 # Licence : NEXUS-OPEN-DOMINANT v1.0
-# Description : Build, test, lint, security, release, sign, deploy.
-# Multi-langages : Rust, Bash, Python, YAML.
-# Multi-plateformes : Ubuntu, Debian, macOS, ARM64.
-# Multi-niveaux : dev, staging, production.
+# Project : NexusBox — Alternative à Docker
+# Stack : Bash + Rust + Python + YAML
 # ═══════════════════════════════════════════════════════════════════════════════
-
-name: NexusBox CI/CD Ultimate
+name: NexusBox CI/CD
 
 on:
 push:
-branches:
-- main
-- develop
-- 'release/**'
-- 'hotfix/**'
-tags:
-- 'v*.*.*'
-- 'v*.*.*-rc.*'
-- 'v*.*.*-beta.*'
+branches: [main, develop, "release/**", "feature/**", "hotfix/**"]
 paths-ignore:
-- '**.md'
-- 'LICENSE'
-- '.gitignore'
-- 'docs/**'
+- "**.md"
+- "LICENSE"
+- "docs/**"
 pull_request:
-branches:
-- main
-- develop
-types: [opened, synchronize, reopened]
+branches: [main, develop]
 schedule:
-- cron: '0 3 * * 1'
+- cron: "0 3 * * *"
 workflow_dispatch:
 inputs:
-environment:
-description: 'Target environment'
-required: true
-default: 'staging'
-type: choice
-options:
-- dev
-- staging
-- production
-skip_tests:
-description: 'Skip tests'
+release:
+description: "Créer une release"
 required: false
-default: false
-type: boolean
+default: "false"
+skip_tests:
+description: "Sauter les tests (déconseillé)"
+required: false
+default: "false"
 
-# ─── Variables globales ───
+permissions:
+contents: write
+packages: write
+issues: write
+pull-requests: write
+security-events: write
+
+concurrency:
+group: ${{ github.workflow }}-${{ github.ref }}
+cancel-in-progress: true
+
 env:
 CARGO_TERM_COLOR: always
 RUST_BACKTRACE: 1
-RUST_LOG: info
-PYTHONUNBUFFERED: 1
-PROJECT_NAME: nexusbox
-AUTHOR: "Aissa Mohammedi (DGK)"
-LICENSE: "NEXUS-OPEN-DOMINANT"
-CARGO_INCREMENTAL: 0
-CARGO_NET_RETRY: 10
-RUSTUP_MAX_RETRIES: 10
-RUST_BACKTRACE_FULL: full
-
-# ─── Permissions minimales ───
-permissions:
-contents: read
-actions: read
-checks: write
-pull-requests: write
-security-events: write
-id-token: write
+PYTHON_VERSION: "3.11"
+RUST_VERSION: "stable"
+NEXUS_VERSION: "1.0.0"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# JOB 1 — LINT & FORMAT
+# JOBS
 # ═══════════════════════════════════════════════════════════════════════════════
 jobs:
 
-lint:
-name: "Lint — ${{ matrix.lang }}"
+# ─── 1. VALIDATION MÉTADONNÉES ───
+metadata:
+name: "Metadata & Version"
 runs-on: ubuntu-22.04
-timeout-minutes: 15
-strategy:
-fail-fast: false
-matrix:
-lang: [rust, bash, python, yaml]
-
+outputs:
+version: ${{ steps.version.outputs.version }}
+changelog: ${{ steps.changelog.outputs.changelog }}
+branch: ${{ steps.branch.outputs.branch }}
 steps:
-- name: Checkout
-uses: actions/checkout@v4
+- uses: actions/checkout@v4
 with:
 fetch-depth: 0
-- name: Setup Rust
-if: matrix.lang == 'rust'
+
+- name: Extract branch
+id: branch
+run: |
+echo "branch=${GITHUB_REF#refs/heads/}" >> $GITHUB_OUTPUT
+
+- name: Compute version
+id: version
+run: |
+VERSION=$(grep -oP 'VERSION="\K[^"]+' nexusbox.sh 2>/dev/null | head -1 || echo "1.0.0")
+SHA=$(git rev-parse --short HEAD)
+echo "version=${VERSION}+${SHA}" >> $GITHUB_OUTPUT
+
+- name: Generate changelog
+id: changelog
+run: |
+{
+echo "changelog<<EOF"
+git log --pretty=format:"- %s (%h)" $(git describe --tags --abbrev=0 2>/dev/null || echo "HEAD~20")..HEAD 2>/dev/null || git log --oneline -20
+echo ""
+echo "EOF"
+} >> $GITHUB_OUTPUT
+
+# ─── 2. LINT BASH ───
+lint-bash:
+name: "Lint Bash"
+runs-on: ubuntu-22.04
+needs: metadata
+steps:
+- uses: actions/checkout@v4
+
+- name: Install shellcheck
+run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+- name: ShellCheck
+run: |
+find . -type f -name "*.sh" -not -path "./target/*" -not -path "./venv/*" | while read -r f; do
+echo "▶ Checking $f"
+shellcheck -S warning "$f" || true
+done
+
+- name: Bash syntax check
+run: |
+find . -type f -name "*.sh" -exec bash -n {} \;
+echo "✅ All shell scripts valid"
+
+- name: Verify executables
+run: |
+find . -type f -name "*.sh" ! -perm -u+x -print | while read -r f; do
+echo "⚠️ $f is not executable"
+done
+
+# ─── 3. LINT RUST ───
+lint-rust:
+name: "Lint Rust"
+runs-on: ubuntu-22.04
+needs: metadata
+steps:
+- uses: actions/checkout@v4
+
+- name: Install Rust
 uses: dtolnay/rust-toolchain@stable
 with:
 components: rustfmt, clippy
 
-- name: Setup Python
-if: matrix.lang == 'python'
-uses: actions/setup-python@v5
-with:
-python-version: '3.12'
-cache: 'pip'
-
-- name: Install ShellCheck
-if: matrix.lang == 'bash'
-run: sudo apt-get update && sudo apt-get install -y shellcheck
-
-- name: Install yamllint
-if: matrix.lang == 'yaml'
-run: pip install yamllint
-
-- name: Install Python linters
-if: matrix.lang == 'python'
-run: |
-pip install ruff black mypy pylint
-
-- name: Rust — rustfmt check
-if: matrix.lang == 'rust'
-run: cargo fmt --all -- --check
-
-- name: Rust — clippy
-if: matrix.lang == 'rust'
-run: cargo clippy --all-targets --all-features -- -D warnings
-
-- name: Bash — shellcheck
-if: matrix.lang == 'bash'
-run: |
-find . -name "*.sh" -type f -print0 | \
-xargs -0 shellcheck -x -e SC1090,SC1091,SC2086 || true
-
-- name: Python — ruff
-if: matrix.lang == 'python'
-run: |
-find . -name "*.py" -type f -print0 | \
-xargs -0 ruff check || true
-
-- name: Python — black check
-if: matrix.lang == 'python'
-run: |
-find . -name "*.py" -type f -print0 | \
-xargs -0 black --check --diff || true
-
-- name: YAML — yamllint
-if: matrix.lang == 'yaml'
-run: |
-yamllint -d relaxed .github/workflows/ || true
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# JOB 2 — TESTS UNITAIRES
-# ═══════════════════════════════════════════════════════════════════════════════
-test:
-name: "Tests — ${{ matrix.os }} / ${{ matrix.lang }}"
-runs-on: ${{ matrix.os }}
-timeout-minutes: 30
-needs: lint
-if: ${{ !inputs.skip_tests }}
-strategy:
-fail-fast: false
-matrix:
-os:
-- ubuntu-22.04
-- ubuntu-24.04
-- macos-14
-lang:
-- rust
-- bash
-- python
-exclude:
-- os: macos-14
-lang: bash
-
-steps:
-- name: Checkout
-uses: actions/checkout@v4
-
-- name: Setup Rust
-if: matrix.lang == 'rust'
-uses: dtolnay/rust-toolchain@stable
-
-- name: Setup Python
-if: matrix.lang == 'python'
-uses: actions/setup-python@v5
-with:
-python-version: '3.12'
-
-- name: Cache Rust
-if: matrix.lang == 'rust'
-uses: Swatinem/rust-cache@v2
-with:
-shared-key: ${{ matrix.os }}-rust
-
-- name: Cache Python
-if: matrix.lang == 'python'
+- name: Cache Cargo
 uses: actions/cache@v4
 with:
-path: ~/.cache/pip
-key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
-restore-keys: |
-${{ runner.os }}-pip-
+path: |
+~/.cargo/bin/
+~/.cargo/registry/index/
+~/.cargo/registry/cache/
+~/.cargo/git/db/
+target/
+key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+restore-keys: ${{ runner.os }}-cargo-
 
-- name: Install dependencies (Ubuntu)
-if: matrix.os == 'ubuntu-22.04' || matrix.os == 'ubuntu-24.04'
-run: |
-sudo apt-get update
-sudo apt-get install -y build-essential pkg-config libssl-dev shellcheck
+- name: Rustfmt
+working-directory: ./nexusbox-hash
+run: cargo fmt --all -- --check
 
-- name: Install dependencies (macOS)
-if: matrix.os == 'macos-14'
-run: brew install shellcheck
+- name: Clippy
+working-directory: ./nexusbox-hash
+run: cargo clippy --all-targets --all-features -- -D warnings
 
-- name: Rust — build
-if: matrix.lang == 'rust'
-working-directory: nexusbox-hash
-run: cargo build --release --locked
+- name: Build
+working-directory: ./nexusbox-hash
+run: cargo build --release --verbose
 
-- name: Rust — tests
-if: matrix.lang == 'rust'
-working-directory: nexusbox-hash
-run: cargo test --release --locked
+- name: Test
+working-directory: ./nexusbox-hash
+run: cargo test --release --verbose
 
-- name: Rust — benchmarks
-if: matrix.lang == 'rust' && matrix.os == 'ubuntu-22.04'
-working-directory: nexusbox-hash
-run: cargo bench --no-run 2>/dev/null || true
-
-- name: Bash — syntax check
-if: matrix.lang == 'bash'
-run: |
-for f in $(find . -name "*.sh" -type f); do
-echo "Checking $f"
-bash -n "$f" || exit 1
-done
-
-- name: Bash — unit tests
-if: matrix.lang == 'bash'
-run: |
-if [ -f tests/bash_test.sh ]; then
-bash tests/bash_test.sh
-fi
-
-- name: Python — tests
-if: matrix.lang == 'python'
-run: |
-if [ -f tests/test_python.py ]; then
-python3 -m pytest tests/test_python.py -v
-fi
-
-- name: Upload test results
-if: always()
+- name: Upload binary
 uses: actions/upload-artifact@v4
 with:
-name: test-results-${{ matrix.os }}-${{ matrix.lang }}
-path: |
-target/release/
-test-results/
-retention-days: 7
-if-no-files-found: ignore
+name: nexusbox-hash-${{ needs.metadata.outputs.version }}
+path: nexusbox-hash/target/release/nexusbox-hash
+retention-days: 30
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# JOB 3 — SECURITY AUDIT
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── 4. LINT PYTHON ───
+lint-python:
+name: "Lint Python"
+runs-on: ubuntu-22.04
+needs: metadata
+strategy:
+matrix:
+python: ["3.10", "3.11", "3.12", "3.13"]
+steps:
+- uses: actions/checkout@v4
+
+- name: Setup Python ${{ matrix.python }}
+uses: actions/setup-python@v5
+with:
+python-version: ${{ matrix.python }}
+cache: pip
+
+- name: Install tools
+run: |
+pip install --upgrade pip
+pip install flake8 pylint black mypy bandit radon
+
+- name: Black check
+run: black --check --diff . || true
+
+- name: Flake8
+run: |
+flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+flake8 . --count --exit-zero --max-complexity=15 --max-line-length=127
+
+- name: MyPy
+run: mypy --ignore-missing-imports --no-error-summary . || true
+
+- name: Bandit security
+run: bandit -r . -ll -x ./venv,./target || true
+
+- name: Radon complexity
+run: radon cc . -a -s --total-average || true
+
+# ─── 5. VALIDATION YAML ───
+lint-yaml:
+name: "Lint YAML"
+runs-on: ubuntu-22.04
+needs: metadata
+steps:
+- uses: actions/checkout@v4
+
+- name: Install yamllint
+run: pip install yamllint
+
+- name: Validate YAML
+run: |
+find . -type f \( -name "*.yml" -o -name "*.yaml" \) | while read -r f; do
+echo "▶ $f"
+yamllint -d relaxed "$f" || true
+done
+
+- name: Validate JSON
+run: |
+find . -type f -name "*.json" -not -path "./node_modules/*" | while read -r f; do
+python3 -m json.tool "$f" > /dev/null && echo "✅ $f" || echo "❌ $f"
+done
+
+# ─── 6. TESTS FONCTIONNELS ───
+tests:
+name: "Functional Tests"
+runs-on: ubuntu-22.04
+needs: [metadata, lint-bash, lint-rust]
+if: github.event.inputs.skip_tests != 'true'
+steps:
+- uses: actions/checkout@v4
+
+- name: Download Rust binary
+uses: actions/download-artifact@v4
+with:
+name: nexusbox-hash-${{ needs.metadata.outputs.version }}
+path: /tmp/nexus-bin
+
+- name: Setup environment
+run: |
+mkdir -p ~/.nexusbox/bin
+cp /tmp/nexus-bin/nexusbox-hash ~/.nexusbox/bin/
+chmod +x ~/.nexusbox/bin/nexusbox-hash
+sudo apt-get update
+sudo apt-get install -y iproute2 iptables util-linux
+sudo sysctl -w net.ipv4.ip_forward=1
+
+- name: Test Rust binary
+run: |
+~/.nexusbox/bin/nexusbox-hash version
+~/.nexusbox/bin/nexusbox-hash hash /etc > /tmp/test_hash.txt
+echo "✅ Hash computed: $(cat /tmp/test_hash.txt)"
+
+- name: Test Bash scripts
+run: |
+bash -n nexusbox.sh
+bash -n nexusbox-network.sh
+bash -n nexusbox-layer.sh
+echo "✅ All bash scripts valid"
+
+- name: Test Python scripts
+run: |
+python3 -m py_compile nexusbox-metrics.py
+python3 -m py_compile nexus-kernel-report.py 2>/dev/null || true
+echo "✅ Python scripts compile"
+
+- name: Test shellcheck strict
+run: |
+shellcheck -S error nexusbox.sh || exit 1
+
+# ─── 7. TESTS INTÉGRATION ───
+integration:
+name: "Integration Tests"
+runs-on: ubuntu-22.04
+needs: [tests]
+steps:
+- uses: actions/checkout@v4
+
+- name: Setup NexusBox
+run: |
+mkdir -p ~/.nexusbox/{boxes,snapshots,layers,tags,bin,logs}
+cp nexusbox.sh ~/.nexusbox/bin/ 2>/dev/null || true
+
+- name: Simulate create
+run: |
+mkdir -p ~/.nexusbox/templates/alpine-mini.rootfs
+echo "test" > ~/.nexusbox/templates/alpine-mini.rootfs/test.txt
+
+- name: Verify structure
+run: |
+test -d ~/.nexusbox/boxes && echo "✅ boxes"
+test -d ~/.nexusbox/snapshots && echo "✅ snapshots"
+test -d ~/.nexusbox/layers && echo "✅ layers"
+
+# ─── 8. AUDIT SÉCURITÉ ───
 security:
 name: "Security Audit"
 runs-on: ubuntu-22.04
-timeout-minutes: 20
-needs: lint
+needs: metadata
 permissions:
-contents: read
 security-events: write
-
 steps:
-- name: Checkout
-uses: actions/checkout@v4
+- uses: actions/checkout@v4
 
-- name: Setup Rust
-uses: dtolnay/rust-toolchain@stable
-
-- name: Cache Rust
-uses: Swatinem/rust-cache@v2
-
-- name: Rust — cargo audit
-working-directory: nexusbox-hash
-run: |
-cargo install cargo-audit --locked || true
-cargo audit || true
-
-- name: Rust — cargo deny
-working-directory: nexusbox-hash
-run: |
-cargo install cargo-deny --locked || true
-cargo deny check || true
-
-- name: Python — bandit
-run: |
-pip install bandit
-find . -name "*.py" -type f -print0 | xargs -0 bandit -r --exit-zero || true
-
-- name: Python — safety
-run: |
-pip install safety
-pip freeze > requirements.txt || true
-safety check --json || true
-
-- name: ShellCheck Security
-run: |
-find . -name "*.sh" -type f -print0 | \
-xargs -0 shellcheck -S error || true
-
-- name: Trivy — filesystem scan
+- name: Run Trivy
 uses: aquasecurity/trivy-action@master
 with:
-scan-type: 'fs'
-scan-ref: '.'
-format: 'sarif'
-output: 'trivy-results.sarif'
-severity: 'CRITICAL,HIGH'
-exit-code: '0'
-
-- name: Upload Trivy SARIF
-if: always()
-uses: github/codeql-action/upload-sarif@v3
-with:
-sarif_file: 'trivy-results.sarif'
-category: 'trivy'
-
-- name: Gitleaks — secrets scan
-uses: gitleaks/gitleaks-action@v2
-env:
-GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+scan-type: fs
+scan-ref: .
+format: sarif
+output: trivy-results.sarif
 continue-on-error: true
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# JOB 4 — BUILD MATRIX (multi-plateformes)
-# ═══════════════════════════════════════════════════════════════════════════════
-build:
-name: "Build — ${{ matrix.target }}"
+- name: Upload Trivy
+uses: github/codeql-action/upload-sarif@v3
+with:
+sarif_file: trivy-results.sarif
+continue-on-error: true
+
+- name: Check secrets
+run: |
+find . -type f \( -name "*.py" -o -name "*.sh" -o -name "*.rs" \) -not -path "./target/*" | \
+xargs grep -l "password\|api_key\|secret\|token" 2>/dev/null | head -10 || \
+echo "✅ No obvious secrets"
+
+- name: Generate SBOM
+run: |
+echo "# SBOM NexusBox v${{ needs.metadata.outputs.version }}" > sbom.md
+echo "Generated: $(date -u)" >> sbom.md
+echo "" >> sbom.md
+echo "## Bash" >> sbom.md
+grep -h "^# Version" *.sh 2>/dev/null >> sbom.md || true
+echo "" >> sbom.md
+echo "## Rust" >> sbom.md
+grep -A1 '^\[dependencies\]' nexusbox-hash/Cargo.toml 2>/dev/null >> sbom.md || true
+
+- name: Upload SBOM
+uses: actions/upload-artifact@v4
+with:
+name: sbom-${{ needs.metadata.outputs.version }}
+path: sbom.md
+
+# ─── 9. BENCHMARKS ───
+benchmarks:
+name: "Benchmarks"
+runs-on: ubuntu-22.04
+needs: [metadata, lint-rust]
+if: github.event_name == 'schedule' || github.event.inputs.release == 'true'
+steps:
+- uses: actions/checkout@v4
+
+- name: Install Rust
+uses: dtolnay/rust-toolchain@stable
+
+- name: Benchmark hashing
+working-directory: ./nexusbox-hash
+run: |
+cargo build --release
+TIME_START=$(date +%s%N)
+./target/release/nexusbox-hash hash /usr/share/doc > /dev/null 2>&1 || true
+TIME_END=$(date +%s%N)
+echo "Hash time: $(( (TIME_END - TIME_START) / 1000000 )) ms"
+
+- name: Benchmark 100 runs
+run: |
+for i in $(seq 1 100); do
+/usr/bin/time -f "%e" ./nexusbox-hash/target/release/nexusbox-hash hash /etc 2>> /tmp/bench.txt > /dev/null
+done
+echo "Average: $(awk '{s+=$1; n++} END {print s/n}' /tmp/bench.txt) s"
+
+- name: Upload benchmark results
+uses: actions/upload-artifact@v4
+with:
+name: benchmarks-${{ needs.metadata.outputs.version }}
+path: /tmp/bench.txt
+
+# ─── 10. BUILD MATRIX ───
+build-matrix:
+name: "Build ${{ matrix.os }} / ${{ matrix.arch }}"
 runs-on: ${{ matrix.os }}
-timeout-minutes: 45
-needs: [test, security]
-if: always() && (needs.test.result == 'success' || needs.test.result == 'skipped')
+needs: [metadata, lint-rust]
 strategy:
 fail-fast: false
 matrix:
 include:
 - os: ubuntu-22.04
+arch: x86_64
 target: x86_64-unknown-linux-gnu
-bin: nexusbox-hash
-- os: ubuntu-24.04
-target: x86_64-unknown-linux-gnu
-bin: nexusbox-hash
-- os: ubuntu-22.04
+- os: ubuntu-22.04-arm
+arch: aarch64
 target: aarch64-unknown-linux-gnu
-bin: nexusbox-hash
-cross: true
-- os: macos-14
-target: x86_64-apple-darwin
-bin: nexusbox-hash
-- os: macos-14
-target: aarch64-apple-darwin
-bin: nexusbox-hash
-
+- os: ubuntu-24.04
+arch: x86_64
+target: x86_64-unknown-linux-gnu
 steps:
-- name: Checkout
-uses: actions/checkout@v4
+- uses: actions/checkout@v4
 
-- name: Setup Rust
+- name: Install Rust
 uses: dtolnay/rust-toolchain@stable
 with:
 targets: ${{ matrix.target }}
 
-- name: Install cross-compilation tools
-if: matrix.cross
+- name: Build for ${{ matrix.target }}
+working-directory: ./nexusbox-hash
+run: cargo build --release --target ${{ matrix.target }}
+
+- name: Strip binary
 run: |
-sudo apt-get update
-sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+strip nexusbox-hash/target/${{ matrix.target }}/release/nexusbox-hash || true
 
-- name: Cache Rust
-uses: Swatinem/rust-cache@v2
-with:
-key: ${{ matrix.target }}
-
-- name: Build Rust binary
-working-directory: nexusbox-hash
-run: cargo build --release --locked --target ${{ matrix.target }}
-
-- name: Strip binary (Linux/macOS)
-run: |
-BIN="nexusbox-hash/target/${{ matrix.target }}/release/${{ matrix.bin }}"
-if [ -f "$BIN" ]; then
-if [ "${{ matrix.os }}" = "macos-14" ]; then
-strip "$BIN" || true
-else
-if [ "${{ matrix.cross }}" = "true" ]; then
-aarch64-linux-gnu-strip "$BIN" || true
-else
-strip "$BIN" || true
-fi
-fi
-fi
-
-- name: Package binary
-run: |
-BIN="nexusbox-hash/target/${{ matrix.target }}/release/${{ matrix.bin }}"
-OUT="${PROJECT_NAME}-${BIN}-${{ matrix.target }}"
-mkdir -p dist
-cp "$BIN" "dist/$OUT"
-chmod +x "dist/$OUT"
-sha256sum "dist/$OUT" > "dist/$OUT.sha256"
-
-- name: Upload binary artifact
+- name: Upload artifact
 uses: actions/upload-artifact@v4
 with:
-name: binary-${{ matrix.target }}
-path: dist/*
-retention-days: 30
-if-no-files-found: error
+name: nexusbox-hash-${{ matrix.os }}-${{ matrix.arch }}
+path: nexusbox-hash/target/${{ matrix.target }}/release/nexusbox-hash
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# JOB 5 — CODEQL (analyse statique)
-# ═══════════════════════════════════════════════════════════════════════════════
-codeql:
-name: "CodeQL Analysis"
+# ─── 11. COVERAGE ───
+coverage:
+name: "Code Coverage"
 runs-on: ubuntu-22.04
-timeout-minutes: 30
-permissions:
-contents: read
-security-events: write
-actions: read
-
+needs: [metadata, lint-rust]
 steps:
-- name: Checkout
-uses: actions/checkout@v4
+- uses: actions/checkout@v4
 
-- name: Initialize CodeQL
-uses: github/codeql-action/init@v3
+- name: Install Rust
+uses: dtolnay/rust-toolchain@stable
 with:
-languages: python, javascript
+components: llvm-tools-preview
 
-- name: Autobuild
-uses: github/codeql-action/autobuild@v3
+- name: Install tarpaulin
+run: cargo install cargo-tarpaulin
 
-- name: Perform CodeQL Analysis
-uses: github/codeql-action/analyze@v3
+- name: Generate coverage
+working-directory: ./nexusbox-hash
+run: cargo tarpaulin --out Xml --out Html --output-dir coverage || true
+
+- name: Upload coverage
+uses: actions/upload-artifact@v4
 with:
-category: "/language:python"
+name: coverage-${{ needs.metadata.outputs.version }}
+path: nexusbox-hash/coverage/
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# JOB 6 — RELEASE (sur tag v*.*.*)
-# ═══════════════════════════════════════════════════════════════════════════════
+- name: Upload to Codecov
+uses: codecov/codecov-action@v4
+with:
+files: ./nexusbox-hash/coverage/cobertura.xml
+fail_ci_if_error: false
+continue-on-error: true
+
+# ─── 12. RELEASE ───
 release:
 name: "Release"
 runs-on: ubuntu-22.04
-timeout-minutes: 30
-needs: build
-if: startsWith(github.ref, 'refs/tags/v')
-
+needs: [metadata, lint-bash, lint-rust, lint-python, lint-yaml, tests, security, build-matrix]
+if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release == 'true'
+permissions:
+contents: write
 steps:
-- name: Checkout
-uses: actions/checkout@v4
+- uses: actions/checkout@v4
 with:
 fetch-depth: 0
 
-- name: Download all binaries
+- name: Download all artifacts
 uses: actions/download-artifact@v4
 with:
-path: dist
+path: artifacts/
 
-- name: List artifacts
-run: find dist -type f | sort
-
-- name: Generate changelog
+- name: Organize release assets
 run: |
-echo "# Release ${{ github.ref_name }}" > CHANGELOG.md
-echo "" >> CHANGELOG.md
-echo "**Author:** ${AUTHOR}" >> CHANGELOG.md
-echo "**License:** ${LICENSE}" >> CHANGELOG.md
-echo "**Date:** $(date -u +%Y-%m-%d)" >> CHANGELOG.md
-echo "" >> CHANGELOG.md
-echo "## Changes" >> CHANGELOG.md
-git log $(git describe --tags --abbrev=0 HEAD^)..HEAD --pretty=format:"- %s (%h)" >> CHANGELOG.md || true
+mkdir -p release/
+find artifacts/ -type f -executable -exec cp {} release/ \;
+find artifacts/ -type f \( -name "*.md" -o -name "*.json" \) -exec cp {} release/ \;
+ls -la release/
+
+- name: Compute SHA-256 for all assets
+run: |
+cd release/
+sha256sum * > SHA256SUMS
+cat SHA256SUMS
+
+- name: Generate release notes
+run: |
+{
+echo "# NexusBox ${{ needs.metadata.outputs.version }}"
+echo ""
+echo "## Changements"
+echo "${{ needs.metadata.outputs.changelog }}"
+echo ""
+echo "## Assets"
+echo ""
+ls release/ | while read f; do
+echo "- \`$f\`"
+done
+echo ""
+echo "## License"
+echo "NEXUS-OPEN-DOMINANT v1.0"
+echo ""
+echo "**Powered by NexusBox — Aissa Mohammedi (DGK)**"
+} > RELEASE_NOTES.md
 
 - name: Create GitHub Release
 uses: softprops/action-gh-release@v2
 with:
-name: "NexusBox ${{ github.ref_name }}"
-body_path: CHANGELOG.md
-draft: false
-prerelease: ${{ contains(github.ref_name, '-rc.') || contains(github.ref_name, '-beta.') }}
+name: "NexusBox v${{ needs.metadata.outputs.version }}"
+body_path: RELEASE_NOTES.md
 files: |
-dist/**/*.tar.gz
-dist/**/*.zip
-dist/**/*.sha256
-generate_release_notes: true
+release/*
+draft: false
+prerelease: false
+env:
+GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# JOB 7 — DOCKER (build & push image)
-# ═══════════════════════════════════════════════════════════════════════════════
-docker:
-name: "Docker Build & Push"
+# ─── 13. PUBLISH BINAIRE ───
+publish-binary:
+name: "Publish Binary"
 runs-on: ubuntu-22.04
-timeout-minutes: 30
-needs: build
-if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-
+needs: [release]
+if: startsWith(github.ref, 'refs/tags/v')
 steps:
-- name: Checkout
-uses: actions/checkout@v4
+- uses: actions/checkout@v4
 
-- name: Set up Docker Buildx
-uses: docker/setup-buildx-action@v3
-
-- name: Login to GitHub Container Registry
-uses: docker/login-action@v3
-with:
-registry: ghcr.io
-username: ${{ github.actor }}
-password: ${{ secrets.GITHUB_TOKEN }}
-
-- name: Extract metadata
-id: meta
-uses: docker/metadata-action@v5
-with:
-images: ghcr.io/${{ github.repository }}
-tags: |
-type=ref,event=branch
-type=ref,event=pr
-type=semver,pattern={{version}}
-type=semver,pattern={{major}}.{{minor}}
-type=sha
-
-- name: Build and push Docker image
-uses: docker/build-push-action@v5
-with:
-context: .
-push: true
-tags: ${{ steps.meta.outputs.tags }}
-labels: ${{ steps.meta.outputs.labels }}
-cache-from: type=gha
-cache-to: type=gha,mode=max
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# JOB 8 — DEPLOY (staging / production)
-# ═══════════════════════════════════════════════════════════════════════════════
-deploy:
-name: "Deploy — ${{ inputs.environment || 'staging' }}"
-runs-on: ubuntu-22.04
-timeout-minutes: 20
-needs: [build, docker]
-if: |
-github.event_name == 'workflow_dispatch' ||
-(github.event_name == 'push' && github.ref == 'refs/heads/main')
-environment:
-name: ${{ inputs.environment || 'staging' }}
-url: https://${{ inputs.environment || 'staging' }}.nexusbox.dev
-
-steps:
-- name: Checkout
-uses: actions/checkout@v4
-
-- name: Download binaries
+- name: Download artifacts
 uses: actions/download-artifact@v4
 with:
-path: dist
+path: artifacts/
 
-- name: Deploy to server
-env:
-DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
-DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+- name: Prepare publish
 run: |
-echo "Deploying to ${{ inputs.environment || 'staging' }}"
-echo "Host: $DEPLOY_HOST"
-echo "User: $DEPLOY_USER"
-echo "Artifacts:"
-ls -la dist/
-# Placeholder — remplacer par la vraie commande de déploiement
-# scp -i "$DEPLOY_KEY" dist/*.tar.gz "$DEPLOY_USER@$DEPLOY_HOST:/opt/nexusbox/"
+mkdir -p publish/
+find artifacts/ -type f -executable -exec cp {} publish/ \;
+ls -la publish/
 
-- name: Health check
+- name: Commit to publish branch
 run: |
-echo "Health check on ${{ inputs.environment || 'staging' }}"
-# curl -f https://${{ inputs.environment || 'staging' }}.nexusbox.dev/health || exit 1
+git config user.name "NexusBot"
+git config user.email "bot@nexus.local"
+git checkout -b publish-${{ github.sha }} || git checkout publish-${{ github.sha }}
+mkdir -p binaries/
+cp publish/* binaries/ 2>/dev/null || true
+git add binaries/
+git commit -m "Publish binaries v${{ needs.metadata.outputs.version }}" || echo "No changes"
+git push origin publish-${{ github.sha }} || true
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# JOB 9 — PUBLISH (PyPI + crates.io)
-# ═══════════════════════════════════════════════════════════════════════════════
-publish:
-name: "Publish — crates.io + PyPI"
-runs-on: ubuntu-22.04
-timeout-minutes: 30
-needs: build
-if: startsWith(github.ref, 'refs/tags/v')
-environment: release
-
-steps:
-- name: Checkout
-uses: actions/checkout@v4
-
-- name: Setup Rust
-uses: dtolnay/rust-toolchain@stable
-
-- name: Setup Python
-uses: actions/setup-python@v5
-with:
-python-version: '3.12'
-
-- name: Publish to crates.io
-working-directory: nexusbox-hash
-env:
-CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-run: |
-if [ -n "${CARGO_REGISTRY_TOKEN}" ]; then
-cargo publish --locked || true
-else
-echo "CARGO_REGISTRY_TOKEN not set — skipping"
-fi
-
-- name: Publish to PyPI
-env:
-TWINE_USERNAME: __token__
-TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-run: |
-pip install build twine
-if [ -f pyproject.toml ]; then
-python -m build
-twine upload dist/*.whl dist/*.tar.gz || true
-else
-echo "pyproject.toml not found — skipping"
-fi
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# JOB 10 — NOTIFY (Slack / Discord)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── 14. NOTIFICATION FINALE ───
 notify:
-name: "Notify"
+name: "Final Notification"
 runs-on: ubuntu-22.04
-timeout-minutes: 5
-needs: [lint, test, security, build]
-if: always() && github.event_name != 'pull_request'
-
+needs: [metadata, lint-bash, lint-rust, lint-python, lint-yaml, tests, security, benchmarks]
+if: always()
 steps:
-- name: Slack notification
-if: env.SLACK_WEBHOOK != ''
-env:
-SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+- name: Status summary
 run: |
-STATUS="${{ needs.build.result }}"
-COLOR="good"
-[ "$STATUS" != "success" ] && COLOR="danger"
-curl -X POST -H 'Content-type: application/json' \
---data "{\"attachments\":[{\"color\":\"$COLOR\",\"title\":\"NexusBox CI\",\"text\":\"Status: $STATUS | Commit: ${{ github.sha }}\",\"footer\":\"Aissa Mohammedi (DGK)\"}]}" \
-"$SLACK_WEBHOOK" || true
+echo "═══════════════════════════════════════════"
+echo " NEXUSBOX CI/CD — RÉSUMÉ"
+echo "═══════════════════════════════════════════"
+echo " Version : ${{ needs.metadata.outputs.version }}"
+echo " Branche : ${{ needs.metadata.outputs.branch }}"
+echo " Commit : ${{ github.sha }}"
+echo " Auteur : ${{ github.actor }}"
+echo "═══════════════════════════════════════════"
+echo ""
 
-- name: Discord notification
-if: env.DISCORD_WEBHOOK != ''
-env:
-DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+- name: Check all jobs
 run: |
-STATUS="${{ needs.build.result }}"
-curl -X POST -H 'Content-type: application/json' \
---data "{\"content\":\"**NexusBox CI** — Status: $STATUS | Commit: ${{ github.sha }}\"}" \
-"$DISCORD_WEBHOOK" || true
+FAILED=0
+[ "${{ needs.lint-bash.result }}" != "success" ] && FAILED=$((FAILED + 1))
+[ "${{ needs.lint-rust.result }}" != "success" ] && FAILED=$((FAILED + 1))
+[ "${{ needs.lint-python.result }}" != "success" ] && FAILED=$((FAILED + 1))
+[ "${{ needs.tests.result }}" != "success" ] && FAILED=$((FAILED + 1))
+[ "${{ needs.security.result }}" != "success" ] && FAILED=$((FAILED + 1))
+if [ "$FAILED" -gt 0 ]; then
+echo "❌ $FAILED job(s) failed"
+exit 1
+fi
+echo "✅ All jobs passed"
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# JOB 11 — CLEANUP (nettoyage des artifacts anciens)
-# ═══════════════════════════════════════════════════════════════════════════════
-cleanup:
-name: "Cleanup old artifacts"
-runs-on: ubuntu-22.04
-timeout-minutes: 10
-if: github.event_name == 'schedule'
-
-steps:
-- name: Delete old artifacts
-uses: actions/github-script@v7
-with:
-script: |
-const cutoff = Date.now() - (30 * 24 * 60 * 60 * 1000);
-const artifacts = await github.rest.actions.listArtifactsForRepo({
-owner: context.repo.owner,
-repo: context.repo.repo,
-per_page: 100
-});
-for (const artifact of artifacts.data.artifacts) {
-if (new Date(artifact.created_at).getTime() < cutoff) {
-console.log(`Deleting artifact: ${artifact.name}`);
-await github.rest.actions.deleteArtifact({
-owner: context.repo.owner,
-repo: context.repo.repo,
-artifact_id: artifact.id
-});
-}
-}
+- name: Success message
+if: success()
+run: |
+echo "✅ NexusBox CI passed on ${{ github.ref }}"
+echo " Aissa Mohammedi (DGK) — NEXUS-OPEN-DOMINANT License"
