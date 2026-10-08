@@ -1,0 +1,60 @@
+Rends-le exécutable :
+
+```bash
+chmod +x ~/Documents/nexus_blanche_net/nexusbox.sh
+```
+
+Vérifie ton système :
+
+```bash
+~/Documents/nexus_blanche_net/nexusbox.sh doctor
+```
+
+Crée ta première box :
+
+```bash
+~/Documents/nexus_blanche_net/nexusbox.sh create demo
+```
+
+Démarre-la :
+
+```bash
+~/Documents/nexus_blanche_net/nexusbox.sh start demo -d
+```
+
+Exécute une commande dedans :
+
+```bash
+~/Documents/nexus_blanche_net/nexusbox.sh exec demo "cat /etc/os-release"
+```
+
+Ajoute un volume :
+
+```bash
+~/Documents/nexus_blanche_net/nexusbox.sh volume add demo /home/nexus/Documents:/data
+```
+
+Ajoute un port :
+
+```bash
+~/Documents/nexus_blanche_net/nexusbox.sh port add demo 8080:80
+```
+
+Arrête-la :
+
+```bash
+~/Documents/nexus_blanche_net/nexusbox.sh stop demo
+```
+
+---
+
+Ce que NexusBox fait différemment de Docker
+
+Docker NexusBox
+Daemon en arrière-plan (dockerd) Aucun daemon
+containerd + runc (~50 Mo) Bash + outils système
+Images stockées dans /var/lib/docker Dossiers simples dans ~/.nexusbox
+Nécessite un registry Télécharge directement
+Cgroups contrôlés par daemon Cgroups v2 directement
+Réseau bridge complexe iptables natif
+Configuration YAML Fichiers texte simples
