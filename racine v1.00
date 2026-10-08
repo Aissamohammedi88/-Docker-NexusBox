@@ -1,0 +1,942 @@
+#!/usr/bin/env bash# ═══════════════════════════════════════════════════════════════════════════════
+# NEXUSBOX — Alternative locale à Docker
+# Auteur : Aissa Mohammedi (DGK)
+# Licence : NEXUS-OPEN-2.0
+# Description : Conteneurs légers sans daemon, basés sur namespaces + cgroups v2
+# + overlayfs. Zéro dépendance externe. Zéro cloud.
+# ═══════════════════════════════════════════════════════════════════════════════
+set -uo pipefail
+
+VERSION="1.0.0"
+AUTEUR="Aissa Mohammedi (DGK)"
+
+# ─── COULEURS ───
+G='\033[92m'; Y='\033[93m'; R='\033[91m'; B='\033[94m'; C='\033[96m'
+M='\033[95m'; W='\033[1;37m'; D='\033[2m'; N='\033[0m'; BOLD='\033[1m'
+
+# ─── CHEMINS ───
+NX_ROOT="${HOME}/.nexusbox"
+NX_BOXES="${NX_ROOT}/boxes"
+NX_TEMPLATES="${NX_ROOT}/templates"
+NX_VOLUMES="${NX_ROOT}/volumes"
+NX_NETWORKS="${NX_ROOT}/networks"
+NX_LOGS="${NX_ROOT}/logs"
+NX_CGROUP_ROOT="/sys/fs/cgroup/nexusbox"
+
+# ─── FONCTIONS AFFICHAGE ───
+ok() { printf " ${G}[OK]${N} %s\n" "$*"; }
+warn() { printf " ${Y}[!!]${N} %s\n" "$*"; }
+err() { printf " ${R}[KO]${N} %s\n" "$*"; }
+info() { printf " ${B}[i] ${N} %s\n" "$*"; }
+sect() { printf "\n${C}═══════════════════════════════════════════════════════════${N}\n"; printf "${C} %s${N}\n" "$*"; printf "${C}═══════════════════════════════════════════════════════════${N}\n\n"; }
+sub() { printf "\n${M} >> %s${N}\n" "$*"; }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. DOCTOR — VÉRIFICATION DES PRÉREQUIS SYSTÈME
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_doctor() {
+sect "NEXUSBOX DOCTOR — Vérification système"
+
+local fatal=0
+
+sub "Noyau Linux"
+local kernel
+kernel=$(uname -r)
+info "Kernel : ${kernel}"
+local kmajor
+kmajor=$(echo "$kernel" | cut -d. -f1)
+local kminor
+kminor=$(echo "$kernel" | cut -d. -f2)
+if [ "$kmajor" -gt 5 ] || { [ "$kmajor" -eq 5 ] && [ "$kminor" -ge 11 ]; }; then
+ok "Kernel >= 5.11 (cgroups v2 + overlayfs natifs)"
+else
+err "Kernel trop ancien : 5.11+ requis"
+fatal=$((fatal + 1))
+fi
+
+sub "cgroups v2"
+if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+ok "cgroups v2 actif"
+info "Contrôleurs : $(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null)"
+else
+err "cgroups v2 non détecté — active avec systemd.unified_cgroup_hierarchy=1"
+fatal=$((fatal + 1))
+fi
+
+sub "overlayfs"
+if grep -q overlay /proc/filesystems 2>/dev/null; then
+ok "overlayfs supporté"
+else
+err "overlayfs non supporté — module kernel manquant"
+fatal=$((fatal + 1))
+fi
+
+sub "user namespaces"
+if [ -f /proc/sys/user/max_user_namespaces ]; then
+local maxns
+maxns=$(cat /proc/sys/user/max_user_namespaces 2>/dev/null)
+if [ "$maxns" -gt 0 ]; then
+ok "user namespaces actifs (max : ${maxns})"
+else
+err "user namespaces désactivés"
+fatal=$((fatal + 1))
+fi
+else
+warn "user namespaces : non configurés"
+fi
+
+sub "Outils requis"
+local outils="unshare mount ip iptables chroot nsenter"
+for outil in $outils; do
+if command -v "$outil" >/dev/null 2>&1; then
+ok "$outil"
+else
+warn "$outil manquant — installe avec : sudo apt install util-linux iproute2 iptables"
+fi
+done
+
+sub "Outils optionnels"
+for outil in jq debootstrap rsync curl; do
+if command -v "$outil" >/dev/null 2>&1; then
+ok "$outil"
+else
+info "$outil absent (optionnel)"
+fi
+done
+
+sub "Espace disque"
+local avail
+avail=$(df -BM "$HOME" 2>/dev/null | awk 'NR==2 {print $4}' | tr -d 'M')
+info "Espace libre : ${avail} Mo"
+if [ "${avail:-0}" -lt 2000 ]; then
+err "Moins de 2 Go libres — libère de l'espace avant de créer des boxes"
+fatal=$((fatal + 1))
+else
+ok "Espace suffisant"
+fi
+
+sub "Privilèges"
+if [ "$(id -u)" -eq 0 ]; then
+ok "Root actif"
+elif sudo -n true 2>/dev/null; then
+ok "sudo disponible (sans mot de passe)"
+else
+warn "sudo avec mot de passe — certaines commandes demanderont ton mot de passe"
+fi
+
+echo ""
+if [ "$fatal" -eq 0 ]; then
+ok "Système prêt pour NexusBox"
+return 0
+else
+err "${fatal} problème(s) critique(s) détecté(s)"
+return 1
+fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2. INITIALISATION DE L'ARBORESCENCE
+# ═══════════════════════════════════════════════════════════════════════════════
+init_nx() {
+mkdir -p "$NX_ROOT" "$NX_BOXES" "$NX_TEMPLATES" "$NX_VOLUMES" "$NX_NETWORKS" "$NX_LOGS" 2>/dev/null
+if [ ! -f "$NX_ROOT/config" ]; then
+cat > "$NX_ROOT/config" <<EOF
+# NexusBox configuration
+VERSION=${VERSION}
+CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+DEFAULT_SHELL=/bin/sh
+DEFAULT_ROOTFS=alpine-mini
+EOF
+fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3. GESTION DU ROOTFS — TÉLÉCHARGEMENT DES TEMPLATES
+# ═══════════════════════════════════════════════════════════════════════════════
+create_alpine_rootfs() {
+local dest="$1"
+local alpine_version="${2:-3.19}"
+local arch
+arch=$(uname -m)
+case "$arch" in
+x86_64) arch="x86_64" ;;
+aarch64) arch="aarch64" ;;
+*) err "Architecture non supportée : $arch"; return 1 ;;
+esac
+
+local tarball="alpine-minirootfs-${alpine_version}.0-${arch}.tar.gz"
+local url="https://dl-cdn.alpinelinux.org/alpine/v${alpine_version%.*}/releases/${arch}/${tarball}"
+local cache="${NX_TEMPLATES}/${tarball}"
+
+if [ ! -f "$cache" ]; then
+info "Téléchargement Alpine ${alpine_version} (${arch})..."
+if ! curl -fsSL "$url" -o "$cache" 2>/dev/null; then
+err "Téléchargement échoué. Vérifie ta connexion."
+return 1
+fi
+ok "Téléchargé : $(du -h "$cache" | cut -f1)"
+else
+ok "Cache : $cache"
+fi
+
+info "Extraction vers $dest..."
+mkdir -p "$dest"
+if ! tar -xzf "$cache" -C "$dest" 2>/dev/null; then
+err "Extraction échouée"
+return 1
+fi
+
+# Configuration minimale
+mkdir -p "$dest"/{proc,sys,dev,tmp,run,root,etc} 2>/dev/null
+echo "nameserver 1.1.1.1" > "$dest/etc/resolv.conf"
+echo "nameserver 8.8.8.8" >> "$dest/etc/resolv.conf"
+echo "nexusbox" > "$dest/etc/hostname"
+ok "Rootfs Alpine créé"
+return 0
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4. GESTION DES TEMPLATES
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_template_list() {
+sect "Templates disponibles"
+if [ -z "$(ls -A "$NX_TEMPLATES"/*.tar.gz 2>/dev/null)" ]; then
+info "Aucun template en cache"
+info "Crée une box pour en télécharger automatiquement"
+return 0
+fi
+printf " %-40s %12s\n" "TEMPLATE" "TAILLE"
+printf " %-40s %12s\n" "────────" "──────"
+for t in "$NX_TEMPLATES"/*.tar.gz; do
+[ -f "$t" ] || continue
+local name
+name=$(basename "$t")
+local size
+size=$(du -h "$t" | cut -f1)
+printf " %-40s %12s\n" "$name" "$size"
+done
+}
+
+cmd_template_fetch() {
+local tpl="${1:-alpine-mini}"
+case "$tpl" in
+alpine-mini|alpine|alpine-3.19)
+create_alpine_rootfs "$NX_TEMPLATES/alpine-mini.rootfs" "3.19"
+;;
+alpine-3.20)
+create_alpine_rootfs "$NX_TEMPLATES/alpine-3.20.rootfs" "3.20"
+;;
+*)
+err "Template inconnu : $tpl"
+info "Templates valides : alpine-mini, alpine-3.20"
+return 1
+;;
+esac
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5. CRÉATION D'UNE BOX
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_create() {
+local name="${1:-}"
+local template="alpine-mini"
+shift || true
+
+while [ $# -gt 0 ]; do
+case "$1" in
+--template) shift; template="$1" ;;
+*) ;;
+esac
+shift
+done
+
+if [ -z "$name" ]; then
+err "Usage : nexusbox create <nom> [--template alpine-mini]"
+return 1
+fi
+
+local box="$NX_BOXES/$name"
+if [ -d "$box" ]; then
+err "Box déjà existante : $name"
+return 1
+fi
+
+sect "Création de la box : $name"
+
+# Vérifie le template
+local rootfs_src="$NX_TEMPLATES/${template}.rootfs"
+if [ ! -d "$rootfs_src" ]; then
+info "Template $template absent — téléchargement..."
+cmd_template_fetch "$template" || return 1
+fi
+
+# Structure
+mkdir -p "$box"/{rootfs,upper,work,merged,logs,state}
+ok "Arborescence créée"
+
+# Copie du rootfs de base
+info "Copie du rootfs (base)..."
+cp -a "$rootfs_src"/. "$box/rootfs/" 2>/dev/null
+ok "Rootfs copié"
+
+# Config
+cat > "$box/config" <<EOF
+NAME=$name
+TEMPLATE=$template
+CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+UPPER_DIR=$box/upper
+WORK_DIR=$box/work
+MERGED_DIR=$box/merged
+ROOTFS_DIR=$box/rootfs
+EOF
+
+# State
+echo "stopped" > "$box/state/status"
+echo "0" > "$box/state/pid"
+
+# Env vide
+touch "$box/env"
+# Volumes vide
+touch "$box/volumes"
+# Ports vide
+touch "$box/ports"
+
+ok "Box créée : $name"
+info "Chemin : $box"
+info "Utilise : nexusbox start $name"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6. DÉMARRAGE D'UNE BOX
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_start() {
+local name="${1:-}"
+local detach=0
+shift || true
+[ "${1:-}" = "-d" ] && detach=1
+
+if [ -z "$name" ]; then
+err "Usage : nexusbox start <nom> [-d]"
+return 1
+fi
+
+local box="$NX_BOXES/$name"
+if [ ! -d "$box" ]; then
+err "Box introuvable : $name"
+return 1
+fi
+
+local status
+status=$(cat "$box/state/status" 2>/dev/null || echo "stopped")
+if [ "$status" = "running" ]; then
+warn "Box déjà démarrée"
+return 0
+fi
+
+sect "Démarrage de la box : $name"
+
+# Prépare overlayfs
+local lower="$box/rootfs"
+local upper="$box/upper"
+local work="$box/work"
+local merged="$box/merged"
+
+mkdir -p "$upper" "$work" "$merged" "$box/rootfs"/{proc,sys,dev,tmp,run} 2>/dev/null
+
+# Monte overlayfs (nécessite root)
+info "Montage overlayfs..."
+if ! sudo mount -t overlay overlay \
+-o lowerdir="$lower",upperdir="$upper",workdir="$work" \
+"$merged" 2>/dev/null; then
+err "Montage overlayfs échoué (root requis)"
+return 1
+fi
+ok "Overlay monté : $merged"
+
+# Prépare les env
+local envfile="$box/env"
+local envargs=()
+while IFS= read -r line; do
+[ -z "$line" ] && continue
+envargs+=(--env "$line")
+done < "$envfile"
+
+# Prépare les volumes
+local volargs=()
+while IFS= read -r line; do
+[ -z "$line" ] && continue
+local host_path="${line%%:*}"
+local box_path="${line##*:}"
+[ -d "$host_path" ] || mkdir -p "$host_path" 2>/dev/null
+volargs+=(--bind "$host_path:$box_path")
+done < "$box/volumes"
+
+# Prépare les ports
+local ports=()
+while IFS= read -r line; do
+[ -z "$line" ] && continue
+ports+=("$line")
+done < "$box/ports"
+
+# Lancement isolé avec namespaces
+local logfile="$box/logs/box.log"
+local pidfile="$box/state/pid"
+
+if [ "$detach" -eq 1 ]; then
+info "Lancement en arrière-plan..."
+sudo unshare \
+--mount --uts --ipc --pid --fork --net \
+chroot "$merged" /bin/sh -c '
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sys /sys 2>/dev/null || true
+mount -t tmpfs tmp /tmp 2>/dev/null || true
+ip link set lo up 2>/dev/null || true
+echo "NEXUSBOX_READY"
+sleep infinity
+' >> "$logfile" 2>&1 &
+local pid=$!
+echo "$pid" > "$pidfile"
+echo "running" > "$box/state/status"
+ok "Box démarrée en arrière-plan (PID : $pid)"
+else
+info "Lancement interactif (Ctrl+D pour quitter)..."
+sudo unshare \
+--mount --uts --ipc --pid --fork --net \
+chroot "$merged" /bin/sh -c '
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sys /sys 2>/dev/null || true
+mount -t tmpfs tmp /tmp 2>/dev/null || true
+ip link set lo up 2>/dev/null || true
+exec /bin/sh
+'
+fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7. ARRÊT D'UNE BOX
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_stop() {
+local name="${1:-}"
+if [ -z "$name" ]; then
+err "Usage : nexusbox stop <nom>"
+return 1
+fi
+
+local box="$NX_BOXES/$name"
+if [ ! -d "$box" ]; then
+err "Box introuvable : $name"
+return 1
+fi
+
+local status
+status=$(cat "$box/state/status" 2>/dev/null || echo "stopped")
+if [ "$status" != "running" ]; then
+warn "Box non démarrée"
+return 0
+fi
+
+sect "Arrêt de la box : $name"
+
+local pid
+pid=$(cat "$box/state/pid" 2>/dev/null || echo "0")
+
+if [ "$pid" -gt 0 ] && kill -0 "$pid" 2>/dev/null; then
+info "Envoi SIGTERM au PID $pid..."
+sudo kill -TERM "$pid" 2>/dev/null
+sleep 2
+if kill -0 "$pid" 2>/dev/null; then
+warn "Processus récalcitrant — SIGKILL"
+sudo kill -KILL "$pid" 2>/dev/null
+fi
+ok "Box arrêtée"
+fi
+
+# Démonte overlayfs
+if mountpoint -q "$box/merged" 2>/dev/null; then
+info "Démontage overlayfs..."
+sudo umount "$box/merged" 2>/dev/null && ok "Démonté" || warn "Déjà démonté"
+fi
+
+echo "stopped" > "$box/state/status"
+echo "0" > "$box/state/pid"
+ok "État mis à jour : stopped"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8. SUPPRESSION D'UNE BOX
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_rm() {
+local name="${1:-}"
+local force=0
+shift || true
+[ "${1:-}" = "-f" ] && force=1
+
+if [ -z "$name" ]; then
+err "Usage : nexusbox rm <nom> [-f]"
+return 1
+fi
+
+local box="$NX_BOXES/$name"
+if [ ! -d "$box" ]; then
+err "Box introuvable : $name"
+return 1
+fi
+
+# Arrête si running
+local status
+status=$(cat "$box/state/status" 2>/dev/null || echo "stopped")
+if [ "$status" = "running" ]; then
+info "Arrêt préalable de la box..."
+cmd_stop "$name"
+fi
+
+if [ "$force" -eq 0 ]; then
+printf " ${Y}Supprimer la box '%s' et toutes ses données ? [y/N] ${N}" "$name"
+read -r answer
+[ "$answer" != "y" ] && [ "$answer" != "Y" ] && { info "Annulé"; return 0; }
+fi
+
+sect "Suppression : $name"
+
+# Démonte tout montage résiduel
+mountpoint -q "$box/merged" 2>/dev/null && sudo umount "$box/merged" 2>/dev/null
+
+# Supprime
+rm -rf "$box"
+ok "Box supprimée : $name"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 9. LISTE DES BOX
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_list() {
+sect "Boxes NexusBox"
+if [ -z "$(ls -A "$NX_BOXES" 2>/dev/null)" ]; then
+info "Aucune box créée"
+info "Crée ta première : nexusbox create ma-box"
+return 0
+fi
+printf " %-20s %-12s %-10s %s\n" "NOM" "STATUT" "PID" "TEMPLATE"
+printf " %-20s %-12s %-10s %s\n" "───" "──────" "───" "────────"
+for box in "$NX_BOXES"/*; do
+[ -d "$box" ] || continue
+local name
+name=$(basename "$box")
+local status
+status=$(cat "$box/state/status" 2>/dev/null || echo "?")
+local pid
+pid=$(cat "$box/state/pid" 2>/dev/null || echo "0")
+local template
+template=$(grep "^TEMPLATE=" "$box/config" 2>/dev/null | cut -d= -f2 || echo "?")
+local color="$R"
+[ "$status" = "running" ] && color="$G"
+printf " %-20s ${color}%-12s${N} %-10s %s\n" "$name" "$status" "$pid" "$template"
+done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 10. EXÉCUTION DANS UNE BOX
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_exec() {
+local name="${1:-}"
+shift || true
+local cmd="$*"
+
+if [ -z "$name" ] || [ -z "$cmd" ]; then
+err "Usage : nexusbox exec <nom> <commande>"
+return 1
+fi
+
+local box="$NX_BOXES/$name"
+if [ ! -d "$box" ]; then
+err "Box introuvable : $name"
+return 1
+fi
+
+local merged="$box/merged"
+if [ ! -d "$merged" ] || [ -z "$(ls -A "$merged" 2>/dev/null)" ]; then
+warn "Box non démarrée — démarrage temporaire"
+cmd_start "$name" -d
+sleep 1
+fi
+
+sudo chroot "$merged" /bin/sh -c "$cmd"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 11. LOGS D'UNE BOX
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_logs() {
+local name="${1:-}"
+local lines="${2:-50}"
+
+if [ -z "$name" ]; then
+err "Usage : nexusbox logs <nom> [nb-lignes]"
+return 1
+fi
+
+local box="$NX_BOXES/$name"
+if [ ! -d "$box" ]; then
+err "Box introuvable : $name"
+return 1
+fi
+
+local logfile="$box/logs/box.log"
+if [ ! -f "$logfile" ]; then
+info "Aucun log pour cette box"
+return 0
+fi
+
+sect "Logs : $name (dernières $lines lignes)"
+tail -n "$lines" "$logfile"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 12. VOLUMES — AJOUT / LISTE
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_volume() {
+local action="${1:-}"
+local name="${2:-}"
+local mapping="${3:-}"
+
+if [ "$action" = "add" ]; then
+if [ -z "$name" ] || [ -z "$mapping" ]; then
+err "Usage : nexusbox volume add <nom> <host:container>"
+return 1
+fi
+local box="$NX_BOXES/$name"
+[ -d "$box" ] || { err "Box introuvable : $name"; return 1; }
+echo "$mapping" >> "$box/volumes"
+ok "Volume ajouté : $mapping"
+elif [ "$action" = "list" ]; then
+if [ -z "$name" ]; then
+err "Usage : nexusbox volume list <nom>"
+return 1
+fi
+local box="$NX_BOXES/$name"
+[ -d "$box" ] || { err "Box introuvable : $name"; return 1; }
+sect "Volumes de $name"
+if [ -s "$box/volumes" ]; then
+cat "$box/volumes" | sed 's/^/ /'
+else
+info "Aucun volume"
+fi
+else
+err "Usage : nexusbox volume {add|list} ..."
+return 1
+fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 13. PORTS — AJOUT / LISTE
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_port() {
+local action="${1:-}"
+local name="${2:-}"
+local mapping="${3:-}"
+
+if [ "$action" = "add" ]; then
+if [ -z "$name" ] || [ -z "$mapping" ]; then
+err "Usage : nexusbox port add <nom> <host:container>"
+return 1
+fi
+local box="$NX_BOXES/$name"
+[ -d "$box" ] || { err "Box introuvable : $name"; return 1; }
+echo "$mapping" >> "$box/ports"
+ok "Port ajouté : $mapping"
+elif [ "$action" = "list" ]; then
+if [ -z "$name" ]; then
+err "Usage : nexusbox port list <nom>"
+return 1
+fi
+local box="$NX_BOXES/$name"
+[ -d "$box" ] || { err "Box introuvable : $name"; return 1; }
+sect "Ports de $name"
+if [ -s "$box/ports" ]; then
+cat "$box/ports" | sed 's/^/ /'
+else
+info "Aucun port"
+fi
+else
+err "Usage : nexusbox port {add|list} ..."
+return 1
+fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 14. ENV — AJOUT / LISTE
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_env() {
+local action="${1:-}"
+local name="${2:-}"
+local kv="${3:-}"
+
+if [ "$action" = "set" ]; then
+if [ -z "$name" ] || [ -z "$kv" ]; then
+err "Usage : nexusbox env set <nom> KEY=VALUE"
+return 1
+fi
+local box="$NX_BOXES/$name"
+[ -d "$box" ] || { err "Box introuvable : $name"; return 1; }
+# Supprime l'ancienne valeur si existante
+grep -v "^${kv%%=*}=" "$box/env" > "$box/env.tmp" 2>/dev/null
+mv "$box/env.tmp" "$box/env"
+echo "$kv" >> "$box/env"
+ok "Env défini : $kv"
+elif [ "$action" = "list" ]; then
+if [ -z "$name" ]; then
+err "Usage : nexusbox env list <nom>"
+return 1
+fi
+local box="$NX_BOXES/$name"
+[ -d "$box" ] || { err "Box introuvable : $name"; return 1; }
+sect "Env de $name"
+if [ -s "$box/env" ]; then
+cat "$box/env" | sed 's/^/ /'
+else
+info "Aucune variable"
+fi
+else
+err "Usage : nexusbox env {set|list} ..."
+return 1
+fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 15. INSPECT — DÉTAILS D'UNE BOX
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_inspect() {
+local name="${1:-}"
+if [ -z "$name" ]; then
+err "Usage : nexusbox inspect <nom>"
+return 1
+fi
+local box="$NX_BOXES/$name"
+if [ ! -d "$box" ]; then
+err "Box introuvable : $name"
+return 1
+fi
+
+sect "Inspection : $name"
+
+sub "Configuration"
+cat "$box/config" 2>/dev/null | sed 's/^/ /'
+
+sub "État"
+info "Statut : $(cat "$box/state/status" 2>/dev/null || echo '?')"
+info "PID : $(cat "$box/state/pid" 2>/dev/null || echo '?')"
+
+sub "Tailles"
+info "Rootfs : $(du -sh "$box/rootfs" 2>/dev/null | cut -f1)"
+info "Upper : $(du -sh "$box/upper" 2>/dev/null | cut -f1)"
+info "Work : $(du -sh "$box/work" 2>/dev/null | cut -f1)"
+info "Logs : $(du -sh "$box/logs" 2>/dev/null | cut -f1)"
+info "Total : $(du -sh "$box" 2>/dev/null | cut -f1)"
+
+sub "Contenu du rootfs"
+ls "$box/rootfs" 2>/dev/null | head -20 | sed 's/^/ /'
+
+sub "Overlayfs monté ?"
+if mountpoint -q "$box/merged" 2>/dev/null; then
+ok "Oui"
+mount | grep "$box/merged" | sed 's/^/ /'
+else
+info "Non"
+fi
+
+sub "Volumes"
+[ -s "$box/volumes" ] && cat "$box/volumes" | sed 's/^/ /' || info "Aucun"
+
+sub "Ports"
+[ -s "$box/ports" ] && cat "$box/ports" | sed 's/^/ /' || info "Aucun"
+
+sub "Env"
+[ -s "$box/env" ] && cat "$box/env" | sed 's/^/ /' || info "Aucun"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 16. HEALTH — ÉTAT GLOBAL DU SYSTÈME NEXUSBOX
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_health() {
+sect "NexusBox Health"
+
+sub "Version"
+info "Version : $VERSION"
+info "Auteur : $AUTEUR"
+
+sub "Chemins"
+info "Racine : $NX_ROOT"
+info "Boxes : $NX_BOXES"
+info "Templates : $NX_TEMPLATES"
+info "Logs : $NX_LOGS"
+
+sub "Statistiques"
+local nb_boxes
+nb_boxes=$(ls -d "$NX_BOXES"/* 2>/dev/null | wc -l)
+local nb_running
+nb_running=0
+for box in "$NX_BOXES"/*; do
+[ -d "$box" ] || continue
+[ "$(cat "$box/state/status" 2>/dev/null)" = "running" ] && nb_running=$((nb_running + 1))
+done
+info "Boxes totales : $nb_boxes"
+info "Boxes actives : $nb_running"
+
+sub "Espace NexusBox"
+info "Total : $(du -sh "$NX_ROOT" 2>/dev/null | cut -f1)"
+
+sub "Espace disque système"
+df -h / | sed 's/^/ /'
+
+sub "Mémoire système"
+free -h | sed 's/^/ /'
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 17. EXPORT — ARCHIVER UNE BOX
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_export() {
+local name="${1:-}"
+local output="${2:-}"
+
+if [ -z "$name" ]; then
+err "Usage : nexusbox export <nom> [fichier.tar.gz]"
+return 1
+fi
+
+local box="$NX_BOXES/$name"
+if [ ! -d "$box" ]; then
+err "Box introuvable : $name"
+return 1
+fi
+
+if [ -z "$output" ]; then
+output="${name}_$(date +%Y%m%d_%H%M%S).tar.gz"
+fi
+
+# Arrête la box
+[ "$(cat "$box/state/status" 2>/dev/null)" = "running" ] && cmd_stop "$name"
+
+sect "Export de $name"
+info "Destination : $output"
+
+tar -czf "$output" -C "$NX_BOXES" "$name" 2>/dev/null
+if [ $? -eq 0 ]; then
+ok "Export réussi : $(du -h "$output" | cut -f1)"
+else
+err "Export échoué"
+return 1
+fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 18. CLEAN — NETTOYAGE DES BOXES ARRÊTÉES
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_clean() {
+sect "Nettoyage NexusBox"
+local total=0
+local cleaned=0
+
+for box in "$NX_BOXES"/*; do
+[ -d "$box" ] || continue
+local name
+name=$(basename "$box")
+local status
+status=$(cat "$box/state/status" 2>/dev/null || echo "stopped")
+
+if [ "$status" = "stopped" ]; then
+local size
+size=$(du -sb "$box" 2>/dev/null | cut -f1)
+total=$((total + size))
+info "Box arrêtée : $name ($(du -sh "$box" 2>/dev/null | cut -f1))"
+cleaned=$((cleaned + 1))
+fi
+done
+
+echo ""
+info "Boxes arrêtées : $cleaned"
+info "Espace potentiel récupérable : $(numfmt --to=iec "$total" 2>/dev/null || echo "$total octets")"
+warn "Aucune suppression automatique. Utilise : nexusbox rm <nom>"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 19. HELP
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_help() {
+echo ""
+printf "${M}╔══════════════════════════════════════════════════════════════╗${N}\n"
+printf "${M}║ NEXUSBOX v%s — Alternative locale à Docker${N} ║\n" "$VERSION"
+printf "${M}║ Auteur : %s${N} ║\n" "$AUTEUR"
+printf "${M}╚══════════════════════════════════════════════════════════════╝${N}\n"
+echo ""
+printf "${BOLD}USAGE${N}\n"
+printf " nexusbox <commande> [options]\n"
+echo ""
+printf "${BOLD}COMMANDES${N}\n"
+printf " ${G}doctor${N} Vérifie les prérequis système\n"
+printf " ${G}create${N} <nom> [--template] Crée une nouvelle box\n"
+printf " ${G}start${N} <nom> [-d] Démarre une box (-d = arrière-plan)\n"
+printf " ${G}stop${N} <nom> Arrête une box\n"
+printf " ${G}rm${N} <nom> [-f] Supprime une box (-f = sans confirmation)\n"
+printf " ${G}list${N} Liste toutes les boxes\n"
+printf " ${G}exec${N} <nom> <cmd> Exécute une commande dans une box\n"
+printf " ${G}logs${N} <nom> [n] Affiche les logs\n"
+printf " ${G}inspect${N} <nom> Détails d'une box\n"
+printf " ${G}export${N} <nom> [fichier] Archive une box en .tar.gz\n"
+printf " ${G}clean${N} Liste les boxes nettoyables\n"
+printf " ${G}health${N} État global du système\n"
+printf " ${G}template${N} list Liste les templates\n"
+printf " ${G}template${N} fetch <nom> Télécharge un template\n"
+printf " ${G}volume${N} add/list Gère les volumes\n"
+printf " ${G}port${N} add/list Gère les ports\n"
+printf " ${G}env${N} set/list Gère les variables d'environnement\n"
+printf " ${G}version${N} Affiche la version\n"
+printf " ${G}help${N} Affiche cette aide\n"
+echo ""
+printf "${BOLD}EXEMPLES${N}\n"
+printf " nexusbox doctor\n"
+printf " nexusbox create ma-box\n"
+printf " nexusbox start ma-box -d\n"
+printf " nexusbox exec ma-box ls /\n"
+printf " nexusbox volume add ma-box /home/data:/data\n"
+printf " nexusbox port add ma-box 8080:80\n"
+printf " nexusbox env set ma-box APP_ENV=prod\n"
+printf " nexusbox logs ma-box 100\n"
+printf " nexusbox stop ma-box\n"
+printf " nexusbox rm ma-box\n"
+echo ""
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 20. CLI DISPATCHER
+# ═══════════════════════════════════════════════════════════════════════════════
+init_nx
+
+main() {
+local cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+doctor) cmd_doctor "$@" ;;
+create) cmd_create "$@" ;;
+start) cmd_start "$@" ;;
+stop) cmd_stop "$@" ;;
+rm|remove) cmd_rm "$@" ;;
+list|ls) cmd_list "$@" ;;
+exec) cmd_exec "$@" ;;
+logs) cmd_logs "$@" ;;
+inspect) cmd_inspect "$@" ;;
+export) cmd_export "$@" ;;
+clean) cmd_clean "$@" ;;
+health) cmd_health "$@" ;;
+template) cmd_template_fetch "$@" ;;
+volume) cmd_volume "$@" ;;
+port) cmd_port "$@" ;;
+env) cmd_env "$@" ;;
+version) echo "NexusBox v${VERSION} — ${AUTEUR}" ;;
+help|-h|--help) cmd_help ;;
+*) err "Commande inconnue : $cmd"; cmd_help; exit 1 ;;
+esac
+}
+
+main "$@"
