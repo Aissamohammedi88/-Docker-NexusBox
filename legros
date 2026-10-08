@@ -1,0 +1,143 @@
+process::exit(1);
+            }
+            match diff_dirs(Path::new(&args[2]), Path::new(&args[3])) {
+                Ok(result) => {
+                    let json = serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e));
+                    println!("{}", json);
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        "compare" => {
+            if args.len() < 4 {
+                eprintln!("Usage: nexusbox-hash compare <hash1> <hash2>");
+                process::exit(1);
+            }
+            if args[2] == args[3] {
+                println!("IDENTICAL");
+                process::exit(0);
+            } else {
+                println!("DIFFERENT");
+                process::exit(1);
+            }
+        }
+        "version" => println!("nexusbox-hash v{}", VERSION),
+        _ => {
+            eprintln!("Unknown command: {}", args[1]);
+            usage();
+            process::exit(1);
+        }
+    }
+}
+
+/// Hash rapide d'un répertoire (SHA-256 sur les chemins + contenus)
+fn hash_dir(root: &Path) -> Result<String, String> {
+    if !root.exists() {
+        return Err(format!("Not found: {}", root.display()));
+    }
+
+    let mut hasher = Sha256::new();
+    let mut entries: Vec<(String, String)> = Vec::new();
+
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if path.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| path.to_string_lossy().to_string());
+
+            let file_hash = hash_file(path)?;
+            entries.push((rel, file_hash));
+        }
+    }
+
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (rel, h) in &entries {
+        hasher.update(rel.as_bytes());
+        hasher.update(b":");
+        hasher.update(h.as_bytes());
+        hasher.update(b"\n");
+    }
+
+    Ok(hex_encode(&hasher.finalize()))
+}
+
+/// Hash SHA-256 d'un fichier (streaming)
+fn hash_file(path: &Path) -> Result<String, String> {
+    let file = File::open(path).map_err(|e| format!("Open {}: {}", path.display(), e))?;
+    let mut reader = BufReader::with_capacity(CHUNK_SIZE, file);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; CHUNK_SIZE];
+
+    loop {
+        let n = reader
+            .read(&mut buffer)
+            .map_err(|e| format!("Read {}: {}", path.display(), e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+
+    Ok(hex_encode(&hasher.finalize()))
+}
+
+/// Scan complet avec métadonnées
+fn scan_dir(root: &Path) -> Result<ScanResult, String> {
+    if !root.exists() {
+        return Err(format!("Not found: {}", root.display()));
+    }
+
+    let mut files: Vec<FileEntry> = Vec::new();
+    let mut total_files: u64 = 0;
+    let mut total_dirs: u64 = 0;
+    let mut total_size: u64 = 0;
+    let mut global_hasher = Sha256::new();
+
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+
+        if path.is_dir() {
+            total_dirs += 1;
+            continue;
+        }
+
+        if !path.is_file() {
+            continue;
+        }
+
+        let meta = match fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let rel = path
+            .strip_prefix(root)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| path.to_string_lossy().to_string());
+
+        let file_hash = hash_file(path).unwrap_or_else(|_| "ERROR".to_string());
+
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        #[cfg(unix)]
+        let mode = {
