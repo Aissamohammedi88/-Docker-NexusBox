@@ -1,0 +1,126 @@
+if box_snap.exists():
+                nb_snap = sum(1 for d in box_snap.iterdir() if d.is_dir())
+
+            if status == "running":
+                state["running_boxes"] += 1
+
+            state["boxes"].append({
+                "name": name,
+                "status": status,
+                "pid": pid,
+                "template": template,
+                "snapshots": nb_snap
+            })
+
+            total_bytes += get_dir_size(box)
+
+    # Snapshots
+    recent = []
+    if NX_SNAPSHOTS.exists():
+        for box_snap in NX_SNAPSHOTS.iterdir():
+            if not box_snap.is_dir():
+                continue
+            for snap in box_snap.iterdir():
+                if not snap.is_dir():
+                    continue
+                state["total_snapshots"] += 1
+                size = get_dir_size(snap)
+                total_bytes += size
+                meta = snap / "meta.json"
+                date = "?"
+                if meta.exists():
+                    try:
+                        data = json.loads(meta.read_text())
+                        date = data.get("created", "?")[:19]
+                    except Exception:
+                        pass
+                recent.append({
+                    "box": box_snap.name,
+                    "tag": snap.name,
+                    "date": date,
+                    "size": fmt_size(size),
+                    "_ts": date
+                })
+        recent.sort(key=lambda x: x["_ts"], reverse=True)
+        recent = recent[:20]
+        for r in recent:
+            del r["_ts"]
+
+    state["recent_snapshots"] = recent
+    state["total_size"] = fmt_size(total_bytes)
+
+    # Layers count
+    if NX_LAYERS.exists():
+        state["total_layers"] = sum(1 for _ in NX_LAYERS.iterdir())
+
+    return state
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def _json(self, data, code=200):
+        body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def _html(self, content, code=200):
+        body = content.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def do_GET(self):
+        p = urllib.parse.urlparse(self.path).path
+        if p in ("/", "/index.html"):
+            self._html(HTML)
+        elif p == "/api/state":
+            self._json(collect_state())
+        elif p == "/health":
+            self._json({"status": "ok", "version": VERSION})
+        else:
+            self._json({"error": "not found"}, 404)
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main():
+    print("")
+    print("=" * 60)
+    print("  NEXUSBOX METRICS v" + VERSION)
+    print("  Auteur : Aissa Mohammedi (DGK)")
+    print("=" * 60)
+    print("")
+    print("  Port      : " + str(PORT))
+    print("  Interface : http://127.0.0.1:" + str(PORT) + "/")
+    print("")
+    try:
+        with Server(("0.0.0.0", PORT), Handler) as httpd:
+            print("  [OK] Dashboard démarré")
+            print("")
+            httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("")
+        print("  Arrêt.")
+    except OSError as e:
+        print("  Erreur port " + str(PORT) + " : " + str(e))
+
+
+if __name__ == "__main__":
+    main()
