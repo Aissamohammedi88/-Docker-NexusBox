@@ -1,0 +1,137 @@
+mkdir -p "$box/upper"
+        ok "Upper réinitialisé"
+    fi
+
+    # Vérification hash
+    sub "Vérification intégrité"
+    if [ -f "$snap/rootfs.hash" ]; then
+        local current
+        current=$(rust_call hash "$box/rootfs" 2>/dev/null || echo "")
+        local expected
+        expected=$(cat "$snap/rootfs.hash")
+        if [ "$current" = "$expected" ]; then
+            ok "Rootfs intact"
+        else
+            warn "Rootfs différent — possible corruption"
+        fi
+    fi
+
+    ok "Rollback terminé"
+    info "Box restaurée à l'état : $tag"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4. DELETE — Supprimer un snapshot
+# ═══════════════════════════════════════════════════════════════════════════════
+layer_delete() {
+    local name="${1:-}"
+    local tag="${2:-}"
+    local force="${3:-}"
+
+    if [ -z "$name" ] || [ -z "$tag" ]; then
+        err "Usage : nexusbox layer delete <box> <tag> [-f]"
+        return 1
+    fi
+
+    local snap="$NX_SNAPSHOTS/$name/$tag"
+    if [ ! -d "$snap" ]; then
+        err "Snapshot introuvable : $tag"
+        return 1
+    fi
+
+    if [ "$force" != "-f" ]; then
+        printf "  ${Y}Supprimer le snapshot '%s' de '%s' ? [y/N] ${N}" "$tag" "$name"
+        read -r answer
+        [ "$answer" != "y" ] && [ "$answer" != "Y" ] && { info "Annulé"; return 0; }
+    fi
+
+    rm -rf "$snap"
+    ok "Snapshot supprimé : $name/$tag"
+
+    # Si plus de snapshots pour cette box, supprime le dossier
+    if [ -z "$(ls -A "$NX_SNAPSHOTS/$name" 2>/dev/null)" ]; then
+        rmdir "$NX_SNAPSHOTS/$name" 2>/dev/null
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5. DIFF — Comparer deux snapshots
+# ═══════════════════════════════════════════════════════════════════════════════
+layer_diff() {
+    local name="${1:-}"
+    local tag1="${2:-}"
+    local tag2="${3:-}"
+
+    if [ -z "$name" ] || [ -z "$tag1" ] || [ -z "$tag2" ]; then
+        err "Usage : nexusbox layer diff <box> <tag1> <tag2>"
+        return 1
+    fi
+
+    local snap1="$NX_SNAPSHOTS/$name/$tag1"
+    local snap2="$NX_SNAPSHOTS/$name/$tag2"
+
+    if [ ! -d "$snap1" ] || [ ! -d "$snap2" ]; then
+        err "Un des snapshots est introuvable"
+        return 1
+    fi
+
+    sect "Diff : $tag1 → $tag2"
+
+    # Utilise Rust pour le diff
+    local result
+    result=$(rust_call diff "$snap1" "$snap2" 2>/dev/null)
+
+    if [ -z "$result" ]; then
+        err "Diff Rust échoué"
+        return 1
+    fi
+
+    # Extrait les stats via jq si dispo, sinon affiche brut
+    if command -v jq >/dev/null 2>&1; then
+        local added modified deleted unchanged
+        added=$(echo "$result" | jq -r '.added' 2>/dev/null)
+        modified=$(echo "$result" | jq -r '.modified' 2>/dev/null)
+        deleted=$(echo "$result" | jq -r '.deleted' 2>/dev/null)
+        unchanged=$(echo "$result" | jq -r '.unchanged' 2>/dev/null)
+
+        info "Ajoutés    : ${added:-0}"
+        info "Modifiés   : ${modified:-0}"
+        info "Supprimés  : ${deleted:-0}"
+        info "Inchangés  : ${unchanged:-0}"
+
+        sub "Détail"
+        echo "$result" | jq -r '.entries[] | "     \(.status): \(.path)"' 2>/dev/null | head -30
+    else
+        echo "$result"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6. TAG — Nommer un snapshot
+# ═══════════════════════════════════════════════════════════════════════════════
+layer_tag() {
+    local name="${1:-}"
+    local tag="${2:-}"
+    local label="${3:-}"
+
+    if [ -z "$name" ] || [ -z "$tag" ] || [ -z "$label" ]; then
+        err "Usage : nexusbox layer tag <box> <tag> <label>"
+        return 1
+    fi
+
+    local snap="$NX_SNAPSHOTS/$name/$tag"
+    [ -d "$snap" ] || { err "Snapshot introuvable"; return 1; }
+
+    mkdir -p "$NX_TAGS/$name"
+    echo "$tag" > "$NX_TAGS/$name/$label"
+
+    ok "Tag '$label' → $name/$tag"
+}
+
+layer_tags() {
+    sect "Tags"
+    [ -z "$(ls -A "$NX_TAGS" 2>/dev/null)" ] && { info "Aucun tag"; return 0; }
+
+    for box_tags in "$NX_TAGS"/*; do
+        [ -d "$box_tags" ] || continue
+        local box_name
