@@ -1,0 +1,107 @@
+box_name=$(basename "$box_tags")
+        sub "$box_name"
+        for tag in "$box_tags"/*; do
+            [ -f "$tag" ] || continue
+            local label
+            label=$(basename "$tag")
+            local ref
+            ref=$(cat "$tag")
+            printf "     %-20s → %s\n" "$label" "$ref"
+        done
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7. PACK — Compresser un snapshot
+# ═══════════════════════════════════════════════════════════════════════════════
+layer_pack() {
+    local name="${1:-}"
+    local tag="${2:-}"
+    local output="${3:-}"
+
+    [ -z "$name" ] || [ -z "$tag" ] && { err "Usage : nexusbox layer pack <box> <tag> [output]"; return 1; }
+
+    local snap="$NX_SNAPSHOTS/$name/$tag"
+    [ -d "$snap" ] || { err "Snapshot introuvable"; return 1; }
+
+    [ -z "$output" ] && output="${name}_${tag}_$(date +%Y%m%d).tar.zst"
+
+    sect "Pack : $name/$tag → $output"
+
+    if command -v zstd >/dev/null 2>&1; then
+        info "Compression zstd (rapide)..."
+        tar -cf - -C "$NX_SNAPSHOTS/$name" "$tag" | zstd -19 -T0 -o "$output" 2>/dev/null
+        ok "Compressé : $(du -h "$output" | cut -f1)"
+    else
+        warn "zstd absent — fallback gzip"
+        tar -czf "${output%.zst}.gz" -C "$NX_SNAPSHOTS/$name" "$tag"
+        ok "Compressé : $(du -h "${output%.zst}.gz" | cut -f1)"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8. STATS — Stats globales des snapshots
+# ═══════════════════════════════════════════════════════════════════════════════
+layer_stats() {
+    sect "Statistiques Layers"
+
+    sub "Snapshots"
+    local count=0
+    local total_size=0
+    for box_snap in "$NX_SNAPSHOTS"/*; do
+        [ -d "$box_snap" ] || continue
+        for snap in "$box_snap"/*; do
+            [ -d "$snap" ] || continue
+            count=$((count + 1))
+            local s
+            s=$(du -sb "$snap" 2>/dev/null | cut -f1)
+            total_size=$((total_size + s))
+        done
+    done
+    info "Total snapshots : $count"
+    info "Taille totale   : $(numfmt --to=iec "$total_size" 2>/dev/null || echo "$total_size octets")"
+
+    sub "Tags"
+    local tag_count
+    tag_count=$(find "$NX_TAGS" -type f 2>/dev/null | wc -l)
+    info "Total tags      : $tag_count"
+
+    sub "Boxes avec snapshots"
+    for box_snap in "$NX_SNAPSHOTS"/*; do
+        [ -d "$box_snap" ] || continue
+        local box_name
+        box_name=$(basename "$box_snap")
+        local nb
+        nb=$(ls -d "$box_snap"/*/ 2>/dev/null | wc -l)
+        printf "     %-20s : %d snapshot(s)\n" "$box_name" "$nb"
+    done
+
+    sub "Binaire Rust"
+    if [ -x "$NX_HASH_BIN" ]; then
+        ok "nexusbox-hash présent"
+        info "Chemin : $NX_HASH_BIN"
+        info "Version : $($NX_HASH_BIN version 2>/dev/null || echo '?')"
+    else
+        warn "nexusbox-hash absent — lance : nexusbox layer build"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 9. HELP
+# ═══════════════════════════════════════════════════════════════════════════════
+layer_help() {
+    echo ""
+    printf "${M}╔══════════════════════════════════════════════════════════════╗${N}\n"
+    printf "${M}║  NEXUSBOX LAYER — Phase 3                                    ║${N}\n"
+    printf "${M}║  Auteur : Aissa Mohammedi (DGK)                              ║${N}\n"
+    printf "${M}╚══════════════════════════════════════════════════════════════╝${N}\n"
+    echo ""
+    printf "${BOLD}SNAPSHOTS${N}\n"
+    printf "  ${G}layer snapshot${N} <box> [tag] [msg]   Créer un snapshot\n"
+    printf "  ${G}layer list${N} [box]                  Lister les snapshots\n"
+    printf "  ${G}layer rollback${N} <box> <tag>         Restaurer un snapshot\n"
+    printf "  ${G}layer delete${N} <box> <tag> [-f]     Supprimer un snapshot\n"
+    printf "  ${G}layer diff${N} <box> <tag1> <tag2>    Comparer deux snapshots\n"
+    echo ""
+    printf "${BOLD}TAGS${N}\n"
+    printf "  ${G}layer tag${N} <box> <tag> <label>     Nommer un snapshot\n"
