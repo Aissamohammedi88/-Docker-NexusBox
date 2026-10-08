@@ -91,7 +91,6 @@ steps:
 uses: actions/checkout@v4
 with:
 fetch-depth: 0
-
 - name: Setup Rust
 if: matrix.lang == 'rust'
 uses: dtolnay/rust-toolchain@stable
