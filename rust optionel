@@ -1,157 +1,119 @@
-[2026-10-08 05 h 34] Notes: [package]
-name = "nexusbox-hash"
-version = "1.0.0"
-edition = "2021"
-authors = ["Aissa Mohammedi (DGK)"]
-description = "Fast filesystem hasher for NexusBox layers"
-license = "NEXUS-OPEN-2.0"
+use std::os::unix::fs::PermissionsExt;
+            meta.permissions().mode()
+        };
+        #[cfg(not(unix))]
+        let mode: u32 = 0;
 
-[dependencies]
-sha2 = "0.10"
-walkdir = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+        global_hasher.update(rel.as_bytes());
+        global_hasher.update(b":");
+        global_hasher.update(file_hash.as_bytes());
+        global_hasher.update(b"\n");
 
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-strip = true
-panic = "abort"
-[2026-10-08 05 h 34] Notes: // ═══════════════════════════════════════════════════════════════════════════════
-// NEXUSBOX-HASH — Fast filesystem hasher
-// Auteur : Aissa Mohammedi (DGK)
-// Licence : NEXUS-OPEN-2.0
-// Description : Hash SHA-256 rapide de répertoires, diff de layers,
-//               scan de métadonnées, pack/unpack binaire.
-// ═══════════════════════════════════════════════════════════════════════════════
+        total_files += 1;
+        total_size += meta.len();
 
-use std::collections::BTreeMap;
-use std::env;
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
-use std::process;
-
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use walkdir::WalkDir;
-
-const VERSION: &str = "1.0.0";
-const CHUNK_SIZE: usize = 65536;
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct FileEntry {
-    path: String,
-    size: u64,
-    hash: String,
-    mtime: u64,
-    mode: u32,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct ScanResult {
-    root: String,
-    total_files: u64,
-    total_dirs: u64,
-    total_size: u64,
-    global_hash: String,
-    files: Vec<FileEntry>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct DiffEntry {
-    path: String,
-    status: String,
-    old_hash: Option<String>,
-    new_hash: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct DiffResult {
-    old_root: String,
-    new_root: String,
-    added: u64,
-    modified: u64,
-    deleted: u64,
-    unchanged: u64,
-    entries: Vec<DiffEntry>,
-}
-
-fn usage() {
-    eprintln!("NEXUSBOX-HASH v{}", VERSION);
-    eprintln!();
-    eprintln!("Usage: nexusbox-hash <command> [args]");
-    eprintln!();
-    eprintln!("Commands:");
-    eprintln!("  hash <dir>              Fast hash of directory");
-    eprintln!("  scan <dir>              Full scan with metadata (JSON)");
-    eprintln!("  diff <old> <new>        Compare two directories (JSON)");
-    eprintln!("  compare <hash1> <hash2> Compare two hashes");
-    eprintln!("  version                 Show version");
-}
-
-fn main() {
-    let args: Vec<String> = env::args().collect();
-
-    if args.len() < 2 {
-        usage();
-        process::exit(1);
+        files.push(FileEntry {
+            path: rel,
+            size: meta.len(),
+            hash: file_hash,
+            mtime,
+            mode,
+        });
     }
 
-    match args[1].as_str() {
-        "hash" => {
-            if args.len() < 3 {
-                eprintln!("Usage: nexusbox-hash hash <dir>");
-                process::exit(1);
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(ScanResult {
+        root: root.to_string_lossy().to_string(),
+        total_files,
+        total_dirs,
+        total_size,
+        global_hash: hex_encode(&global_hasher.finalize()),
+        files,
+    })
+}
+
+/// Diff entre deux répertoires
+fn diff_dirs(old_root: &Path, new_root: &Path) -> Result<DiffResult, String> {
+    let old_scan = scan_dir(old_root)?;
+    let new_scan = scan_dir(new_root)?;
+
+    let old_map: BTreeMap<String, String> = old_scan
+        .files
+        .into_iter()
+        .map(|f| (f.path, f.hash))
+        .collect();
+    let new_map: BTreeMap<String, String> = new_scan
+        .files
+        .into_iter()
+        .map(|f| (f.path, f.hash))
+        .collect();
+
+    let mut entries: Vec<DiffEntry> = Vec::new();
+    let mut added: u64 = 0;
+    let mut modified: u64 = 0;
+    let mut deleted: u64 = 0;
+    let mut unchanged: u64 = 0;
+
+    // Fichiers nouveaux ou modifiés
+    for (path, new_hash) in &new_map {
+        match old_map.get(path) {
+            None => {
+                added += 1;
+                entries.push(DiffEntry {
+                    path: path.clone(),
+                    status: "ADDED".to_string(),
+                    old_hash: None,
+                    new_hash: Some(new_hash.clone()),
+                });
             }
-            match hash_dir(Path::new(&args[2])) {
-                Ok(h) => println!("{}", h),
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    process::exit(1);
+            Some(old_hash) => {
+                if old_hash != new_hash {
+                    modified += 1;
+                    entries.push(DiffEntry {
+                        path: path.clone(),
+                        status: "MODIFIED".to_string(),
+                        old_hash: Some(old_hash.clone()),
+                        new_hash: Some(new_hash.clone()),
+                    });
+                } else {
+                    unchanged += 1;
                 }
             }
         }
-        "scan" => {
-            if args.len() < 3 {
-                eprintln!("Usage: nexusbox-hash scan <dir>");
-                process::exit(1);
-            }
-            match scan_dir(Path::new(&args[2])) {
-                Ok(result) => {
-                    let json = serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e));
-                    println!("{}", json);
-                }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    process::exit(1);
-                }
-            }
+    }
+
+    // Fichiers supprimés
+    for (path, old_hash) in &old_map {
+        if !new_map.contains_key(path) {
+            deleted += 1;
+            entries.push(DiffEntry {
+                path: path.clone(),
+                status: "DELETED".to_string(),
+                old_hash: Some(old_hash.clone()),
+                new_hash: None,
+            });
         }
-        "diff" => {
-            if args.len() < 4 {
-                eprintln!("Usage: nexusbox-hash diff <old_dir> <new_dir>");
-                process::exit(1);
-            }
-            match diff_dirs(Path::new(&args[2]), Path::new(&args[3])) {
-                Ok(result) => {
-                    let json = serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e));
-                    println!("{}", json);
-                }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    process::exit(1);
-                }
-            }
-        }
-        "compare" => {
-            if args.len() < 4 {
-                eprintln!("Usage: nexusbox-hash compare <hash1> <hash2>");
-                process::exit(1);
-            }
-            if args[2] == args[3] {
-                println!("IDENTICAL");
-                process::exit(0);
+    }
+
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(DiffResult {
+        old_root: old_root.to_string_lossy().to_string(),
+        new_root: new_root.to_string_lossy().to_string(),
+        added,
+        modified,
+        deleted,
+        unchanged,
+        entries,
+    })
+}
+
+/// Encode un hash en hexadécimal
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
