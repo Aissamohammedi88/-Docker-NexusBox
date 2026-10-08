@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+NEXUSBOX METRICS — Dashboard web
+Auteur : Aissa Mohammedi (DGK)
+Port : 10500
+"""
+import os
+import json
+import time
+import socket
+import threading
+import http.server
+import socketserver
+import urllib.parse
+from pathlib import Path
+from datetime import datetime
+
+NX_ROOT = Path.home() / ".nexusbox"
+NX_BOXES = NX_ROOT / "boxes"
+NX_SNAPSHOTS = NX_ROOT / "snapshots"
+NX_LAYERS = NX_ROOT / "layers"
+
+PORT = 10500
+VERSION = "1.0.0"
+
+HTML = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NexusBox Metrics</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0014;color:#fff;font-family:-apple-system,system-ui,sans-serif;padding:20px;min-height:100vh}
+.c{max-width:1200px;margin:0 auto}
+h1{color:#c8a45c;font-size:28px;margin-bottom:6px}
+.s{color:#888;font-size:12px;margin-bottom:24px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:24px}
+.stat{background:#14001f;border:1px solid #2a1a3a;border-radius:12px;padding:18px;text-align:center}
+.stat .n{font-size:32px;font-weight:700;color:#c8a45c;display:block}
+.stat .l{font-size:10px;color:#888;text-transform:uppercase;letter-spacing:1px;margin-top:6px;display:block}
+.section{background:#14001f;border:1px solid #2a1a3a;border-radius:12px;padding:20px;margin-bottom:16px}
+.section h2{color:#c8a45c;font-size:16px;margin-bottom:14px;border-bottom:1px solid #2a1a3a;padding-bottom:8px}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;color:#888;font-size:11px;text-transform:uppercase;letter-spacing:1px;padding:8px 4px;border-bottom:1px solid #2a1a3a}
+td{padding:10px 4px;font-size:13px;border-bottom:1px solid #1a0a25}
+tr:last-child td{border-bottom:none}
+.badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11px;font-weight:600}
+.badge.running{background:#4ade8020;color:#4ade80}
+.badge.stopped{background:#f8717120;color:#f87171}
+.refresh{position:fixed;bottom:20px;right:20px;background:#c8a45c;color:#000;border:none;padding:14px 24px;border-radius:999px;font-weight:700;cursor:pointer;font-size:14px}
+.refresh:hover{opacity:0.9}
+pre{background:#0a0014;padding:12px;border-radius:8px;color:#4ade80;font-family:monospace;font-size:12px;overflow-x:auto}
+</style>
+</head>
+<body>
+<div class="c">
+<h1>NexusBox Metrics</h1>
+<p class="s">Dashboard temps réel · Aissa Mohammedi (DGK)</p>
+
+<div class="grid" id="stats">
+<div class="stat"><span class="n" id="boxes">-</span><span class="l">Boxes</span></div>
+<div class="stat"><span class="n" id="running">-</span><span class="l">Actives</span></div>
+<div class="stat"><span class="n" id="snapshots">-</span><span class="l">Snapshots</span></div>
