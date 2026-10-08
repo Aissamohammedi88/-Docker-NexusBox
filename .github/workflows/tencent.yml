@@ -1,0 +1,65 @@
+Étape 3 — Compiler :
+cargo build --release
+
+Étape 4 — Rendre les scripts exécutables :
+chmod +x ~/Documents/nexus_blanche_net/nexusbox-layer.sh
+chmod +x ~/Documents/nexus_blanche_net/nexusbox-metrics.py
+
+Étape 5 — Lancer le dashboard :
+python3 ~/Documents/nexus_blanche_net/nexusbox-metrics.py
+
+Puis ouvre Safari :
+http://127.0.0.1:10500/
+
+Étape 6 — Utiliser les layers :
+# Compiler le binaire Rust via le script
+~/Documents/nexus_blanche_net/nexusbox-layer.sh build
+
+# Créer un snapshot
+~/Documents/nexus_blanche_net/nexusbox-layer.sh snapshot demo backup-1 "Premier snapshot"
+
+# Lister
+~/Documents/nexus_blanche_net/nexusbox-layer.sh list demo
+
+# Comparer deux snapshots
+~/Documents/nexus_blanche_net/nexusbox-layer.sh diff demo backup-1 backup-2
+
+# Rollback
+~/Documents/nexus_blanche_net/nexusbox-layer.sh rollback demo backup-1
+
+# Stats
+~/Documents/nexus_blanche_net/nexusbox-layer.sh stats
+
+---
+
+Récapitulatif des 3 phases
+
+Phase Langages Lignes Fonctionnalités
+Phase 1 Bash ~980 Conteneurs, overlayfs, cycle de vie, volumes, ports, env
+Phase 2 Bash ~750 Bridge, veth, NAT, DNS interne, load balancer, firewall
+Phase 3 Rust + Bash + Python ~1150 Snapshots, rollback, layers, tags, diff, pack, dashboard
+TOTAL 4 langages ~2880 Alternative complète à Docker
+
+---
+
+Ce qui est marié dans Phase 3
+
+Composant Langage Rôle
+nexusbox-hash Rust Hashing ultra-rapide (SHA-256 streaming), diff de layers
+nexusbox-layer.sh Bash Orchestration, snapshots, rollback, tags, pack
+nexusbox-metrics.py Python Dashboard web, collecte de stats
+Intégration JSON Communication entre les 3 langages
+
+---
+
+Total final
+
+NexusBox — Alternative complète à Docker :
+
+· Zéro daemon
+· 4 langages mariés (Bash, Rust, Python, JSON)
+· ~2880 lignes
+· Zéro dépendance cloud
+· Zéro suppression
+
+Lance layer build puis snapshot demo backup-1. Colle-moi le résultat.
