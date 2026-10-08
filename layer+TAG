@@ -1,0 +1,37 @@
+printf "  ${G}layer tags${N}                        Lister les tags\n"
+    echo ""
+    printf "${BOLD}ARCHIVAGE${N}\n"
+    printf "  ${G}layer pack${N} <box> <tag> [out]      Compresser (zstd)\n"
+    echo ""
+    printf "${BOLD}SYSTÈME${N}\n"
+    printf "  ${G}layer build${N}                       Compiler le binaire Rust\n"
+    printf "  ${G}layer stats${N}                       Statistiques globales\n"
+    echo ""
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════════════════════
+layer_main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        snapshot)  layer_snapshot "$@" ;;
+        list|ls)   layer_list "$@" ;;
+        rollback)  layer_rollback "$@" ;;
+        delete|rm) layer_delete "$@" ;;
+        diff)      layer_diff "$@" ;;
+        tag)       layer_tag "$@" ;;
+        tags)      layer_tags "$@" ;;
+        pack)      layer_pack "$@" ;;
+        stats)     layer_stats "$@" ;;
+        build)     build_rust "$@" ;;
+        help|-h|--help|"") layer_help ;;
+        *) err "Commande inconnue : $cmd"; layer_help; exit 1 ;;
+    esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    layer_main "$@"
+fi
