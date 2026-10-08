@@ -1,0 +1,133 @@
+warn()  { printf "  ${Y}[!!]${N} %s\n" "$*"; }
+err()   { printf "  ${R}[KO]${N} %s\n" "$*"; }
+info()  { printf "  ${B}[i] ${N} %s\n" "$*"; }
+sect()  { printf "\n${C}═══════════════════════════════════════════════════════════${N}\n"; printf "${C}  %s${N}\n" "$*"; printf "${C}═══════════════════════════════════════════════════════════${N}\n\n"; }
+sub()   { printf "\n${M}  >> %s${N}\n" "$*"; }
+
+mkdir -p "$NX_SNAPSHOTS" "$NX_LAYERS" "$NX_TAGS" "$NX_ROOT/bin" 2>/dev/null
+
+# ─── Build du binaire Rust si absent ───
+build_rust() {
+    if [ -x "$NX_HASH_BIN" ]; then
+        return 0
+    fi
+
+    sect "Compilation du binaire Rust nexusbox-hash"
+
+    local src_dir="$HOME/Documents/nexus_blanche_net/nexusbox-hash"
+    if [ ! -d "$src_dir" ]; then
+        err "Source Rust introuvable : $src_dir"
+        info "Crée le projet : cargo new --bin nexusbox-hash"
+        return 1
+    fi
+
+    if ! command -v cargo >/dev/null 2>&1; then
+        err "Cargo (Rust) non installé"
+        info "Installation : curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+        return 1
+    fi
+
+    info "Compilation en cours..."
+    ( cd "$src_dir" && cargo build --release 2>&1 | tail -3 )
+
+    if [ -f "$src_dir/target/release/nexusbox-hash" ]; then
+        cp "$src_dir/target/release/nexusbox-hash" "$NX_HASH_BIN"
+        chmod +x "$NX_HASH_BIN"
+        ok "Binaire installé : $NX_HASH_BIN"
+        return 0
+    else
+        err "Compilation échouée"
+        return 1
+    fi
+}
+
+# ─── Wrapper appel Rust ───
+rust_call() {
+    if [ ! -x "$NX_HASH_BIN" ]; then
+        build_rust || return 1
+    fi
+    "$NX_HASH_BIN" "$@"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. SNAPSHOT — Créer un snapshot d'une box
+# ═══════════════════════════════════════════════════════════════════════════════
+layer_snapshot() {
+    local name="${1:-}"
+    local tag="${2:-}"
+    local message="${3:-}"
+
+    if [ -z "$name" ]; then
+        err "Usage : nexusbox layer snapshot <box> [tag] [message]"
+        return 1
+    fi
+
+    local box="$NX_BOXES/$name"
+    if [ ! -d "$box" ]; then
+        err "Box introuvable : $name"
+        return 1
+    fi
+
+    # Tag automatique si absent
+    if [ -z "$tag" ]; then
+        tag="snap-$(date +%Y%m%d-%H%M%S)"
+    fi
+
+    sect "Snapshot : $name → $tag"
+
+    # Arrête la box pour éviter les écritures en cours
+    local status
+    status=$(cat "$box/state/status" 2>/dev/null || echo "stopped")
+    if [ "$status" = "running" ]; then
+        warn "Box en cours — arrêt temporaire"
+        bash "$HOME/Documents/nexus_blanche_net/nexusbox.sh" stop "$name" 2>/dev/null
+    fi
+
+    local snap_dir="$NX_SNAPSHOTS/${name}/${tag}"
+    mkdir -p "$snap_dir"
+
+    # Métadonnées
+    cat > "$snap_dir/meta.json" <<EOF
+{
+  "box": "$name",
+  "tag": "$tag",
+  "message": "$message",
+  "created": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "host": "$(hostname)",
+  "user": "$USER"
+}
+EOF
+
+    # Hash du rootfs via Rust
+    sub "Calcul du hash (Rust)"
+    local hash_rootfs=""
+    if hash_rootfs=$(rust_call hash "$box/rootfs" 2>/dev/null); then
+        echo "$hash_rootfs" > "$snap_dir/rootfs.hash"
+        ok "Hash rootfs : ${hash_rootfs:0:16}..."
+    else
+        warn "Hash rootfs échoué"
+    fi
+
+    # Hash de l'upper (les modifs)
+    local hash_upper=""
+    if [ -d "$box/upper" ] && [ "$(ls -A "$box/upper" 2>/dev/null)" ]; then
+        if hash_upper=$(rust_call hash "$box/upper" 2>/dev/null); then
+            echo "$hash_upper" > "$snap_dir/upper.hash"
+            ok "Hash upper : ${hash_upper:0:16}..."
+        fi
+    else
+        info "Upper vide — pas de modification depuis la création"
+    fi
+
+    # Copie de l'upper (les vraies données modifiées)
+    sub "Copie des layers"
+    if [ -d "$box/upper" ] && [ "$(ls -A "$box/upper" 2>/dev/null)" ]; then
+        cp -a "$box/upper" "$snap_dir/upper" 2>/dev/null
+        ok "Upper copié : $(du -sh "$snap_dir/upper" 2>/dev/null | cut -f1)"
+    fi
+
+    # Config de la box
+    cp -a "$box/config" "$snap_dir/box.conf" 2>/dev/null
+
+    # Snapshot global hash
+    local snap_hash=""
